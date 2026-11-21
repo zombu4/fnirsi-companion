@@ -20,15 +20,67 @@ import os
 import struct
 import sys
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QComboBox, QFormLayout, QLabel, QProgressBar, QPushButton,
-                               QVBoxLayout)
+from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QHeaderView, QProgressBar, QPushButton,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ...core import releases
 from ...devices import c2c53t as c2
 from ...devices import lc1020e as lc
-from ..base import Page, describe_error, group, row
+from ..base import Page, describe_error, row
+from ..widgets import Badge, Card, DeviceDrawing, StatRow, label, set_kind
+from .data_pages import fit_table, setup_table
+
+# the badge of a release by its relation to the meter (core.releases.relation)
+RELATION_BADGE = {"newer": ("newer", "newer"), "same": ("installed", "installed"),
+                  "older": ("older", "older"), "unknown": ("not known", "unknown")}
+
+
+def pair(name: str, value: QWidget) -> QWidget:
+    """A caption over a mono value (the reference meter page's Firmware / Bootloader row)."""
+    w = QWidget()
+    v = QVBoxLayout(w)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(3)
+    v.addWidget(label(name, "caption"))
+    v.addWidget(value)
+    return w
+
+
+def _cell(*widgets_and_align) -> QWidget:
+    """A table cell holding widgets in a row: _cell(w, align) or _cell(w1, align, w2)."""
+    box = QWidget()
+    h = QHBoxLayout(box)
+    h.setContentsMargins(8, 0, 8, 0)
+    h.setSpacing(6)
+    ws = [w for w in widgets_and_align if isinstance(w, QWidget)]
+    align = next((a for a in widgets_and_align if not isinstance(a, QWidget)), Qt.AlignLeft)
+    if align == Qt.AlignRight:
+        h.addStretch(1)
+    for w in ws:
+        h.addWidget(w, 0, Qt.AlignVCenter)
+    if align != Qt.AlignRight:
+        h.addStretch(1)
+    return box
+
+
+def header_card(title_label, sub_label) -> tuple[Card, QVBoxLayout]:
+    """The meter page's top card: the device drawing, the model name and the line under it;
+    returns the card and the column right of the drawing."""
+    card = Card()
+    top = QHBoxLayout()
+    top.setSpacing(18)
+    top.addWidget(DeviceDrawing(), 0, Qt.AlignTop)
+    col = QVBoxLayout()
+    col.setSpacing(4)
+    col.addSpacing(6)
+    col.addWidget(title_label)
+    col.addWidget(sub_label)
+    col.addStretch(1)
+    top.addLayout(col, 1)
+    card.add(top)
+    return card, col
 
 
 def check_file(model: str, data: bytes) -> str:
@@ -132,79 +184,130 @@ class MeterPage(Page):
         mod = lc if self.is_lc else c2
         self.mod = mod
 
-        self.info_form = QFormLayout()
+        grid = QGridLayout()
+        grid.setSpacing(16)
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 1)
+        left = QVBoxLayout()
+        left.setSpacing(16)
+        right = QVBoxLayout()
+        right.setSpacing(16)
+        grid.addLayout(left, 0, 0)
+        grid.addLayout(right, 0, 1)
+        self.body.addLayout(grid)
+
+        # header card: drawing, model, port, the identity pairs, the INFO rows, battery
         self.info_labels = {}
-        for key, name in (("model", "Model"), ("firmware", "Firmware"), ("uid", "Chip UID"),
-                          ("serial", "USB serial number"), ("port", "Port"),
-                          ("protocol", "Protocol version"), ("caps", "Capability bits"),
-                          ("slot", "Bootloader slot"), ("slot_version", "Bootloader version"),
-                          ("app_size", "Application size"), ("update", "Last update result")):
-            lab = QLabel("—")
+        name = label("—", "name")
+        sub = label("—", "caption")
+        card, _col = header_card(name, sub)
+        self.info_labels["model"] = name
+        self.info_labels["port"] = sub
+        pairs = QGridLayout()
+        pairs.setHorizontalSpacing(18)
+        for col, (key, title, stretch) in enumerate((("firmware", "Firmware", 2),
+                                                     ("slot", "Bootloader", 1),
+                                                     ("uid", "Chip UID", 3),
+                                                     ("companion", "Companion", 1))):
+            v = label("—", "value")
+            v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            v.setWordWrap(True)
+            self.info_labels[key] = v
+            pairs.addWidget(pair(title, v), 0, col)
+            pairs.setColumnStretch(col, stretch)
+        card.add(pairs)
+        rows = (("protocol", "Protocol version"), ("caps", "Capability bits"),
+                ("app_size", "Application size"), ("update", "Last update result"),
+                ("serial", "USB serial number"))
+        for key, title in rows:
+            r = StatRow(title)
+            self.info_labels[key] = r.value
+            card.add(r)
+        bat = StatRow("Battery", line=False)
+        self.battery_label = bat.value
+        card.add(bat)
+        for key, lab in self.info_labels.items():
             lab.setObjectName("info_" + key)
-            self.info_form.addRow(name, lab)
-            self.info_labels[key] = lab
+        self.battery_label.setObjectName("battery")
         self.info_button = self.control(QPushButton("Read INFO again"), mod.INFO)
         self.info_button.clicked.connect(self.read_info)
-        self.info_form.addRow(self.info_button)
-        self.body.addWidget(group("INFO", self.info_form))
-
-        self.battery_label = QLabel("—")
-        self.battery_label.setObjectName("battery")
         self.battery_button = self.control(QPushButton("Read battery"), mod.BATTERY)
         self.battery_button.clicked.connect(self.read_battery)
-        self.body.addWidget(group("Battery", row(self.battery_label, self.battery_button)))
+        card.add(row(self.info_button, self.battery_button))
+        left.addWidget(card)
 
-        up = QVBoxLayout()
+        # install a version: the releases as a table, a file of one's own
         update_code = lc.UPDATE_MODE if self.is_lc else c2.FW_BEGIN
-        self.file_button = self.control(QPushButton("Install application file…"), update_code)
-        self.file_button.clicked.connect(self.update_from_file)
-        self.check_button = QPushButton("Check releases")
+        self.update_code = update_code
+        inst = Card("Install a version")
+        self.check_button = set_kind(QPushButton("Refresh list"), "small")
         self.check_button.clicked.connect(lambda: self.check_releases(False))
-        self.release_combo = QComboBox()
-        self.release_combo.setMinimumWidth(320)
-        self.install_release = self.control(QPushButton("Install selected release"), update_code)
-        self.install_release.clicked.connect(self.update_from_release)
-        self.release_page = QPushButton("Open release page")
+        inst.add_right(self.check_button)
+        self.release_page = set_kind(QPushButton("Releases page"), "small")
         self.release_page.clicked.connect(self._open_release_page)
-        self.release_note = QLabel("")
-        self.release_note.setWordWrap(True)
+        inst.add_right(self.release_page)
+        inst.add(label("The releases of the %s firmware; a release download is checked against "
+                       "its SHA256SUMS, a file of your own gets its own warning."
+                       % device.model, "hint", word_wrap=True))
+        self.release_table = QTableWidget(0, 4)
+        self.release_table.setObjectName("releases")
+        self.release_table.setHorizontalHeaderLabels(["Version", "Released", "On this meter", ""])
+        setup_table(self.release_table)
+        hh = self.release_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.release_table.hide()
+        inst.add(self.release_table)
+        self.no_releases = label("Refresh list asks GitHub for the releases.", "hint")
+        inst.add(self.no_releases)
+        self.release_note = label("", "hint", word_wrap=True)
+        inst.add(self.release_note)
+        self.file_button = self.control(set_kind(QPushButton("Install a file…"), "danger"),
+                                        update_code)
+        self.file_button.clicked.connect(self.update_from_file)
+        inst.add(row(self.file_button))
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
-        self.progress_text = QLabel("")
-        self.progress_text.setWordWrap(True)
-        up.addLayout(row(self.file_button))
-        up.addLayout(row(self.check_button, self.release_combo, self.install_release,
-                         self.release_page))
-        up.addWidget(self.release_note)
+        self.progress_text = label("", "mono", word_wrap=True)
+        inst.add(self.progress)
+        inst.add(self.progress_text)
+        left.addWidget(inst)
+        left.addStretch(1)
+
+        # bootloader slots (LC1020E)
         if self.is_lc:
-            self.boot_status_button = self.control(QPushButton("Read bootloader slots"),
+            slots = Card("Bootloader slots")
+            self.boot_status_button = self.control(set_kind(QPushButton("Read"), "small"),
                                                    lc.BOOT_STATUS)
             self.boot_status_button.clicked.connect(self.read_boot_status)
-            self.boot_file_button = self.control(QPushButton("Install bootloader slot file…"),
-                                                 lc.BOOT_BEGIN)
+            slots.add_right(self.boot_status_button)
+            self.boot_file_button = self.control(
+                set_kind(QPushButton("Install a slot file…"), "danger"), lc.BOOT_BEGIN)
             self.boot_file_button.clicked.connect(self.boot_update)
-            self.boot_text = QLabel("")
-            self.boot_text.setWordWrap(True)
-            up.addLayout(row(self.boot_status_button, self.boot_file_button))
-            up.addWidget(self.boot_text)
-        up.addWidget(self.progress)
-        up.addWidget(self.progress_text)
-        self.body.addWidget(group("Updates", up))
+            self.boot_text = label("Read shows the three slots and the record of the next "
+                                   "start.", "mono", word_wrap=True)
+            slots.add(self.boot_text)
+            slots.add(row(self.boot_file_button))
+            right.addWidget(slots)
 
-        self.reset_button = self.control(QPushButton("RESET (restart the meter)"), mod.RESET)
+        # the meter: restart, power off
+        mc = Card("Meter")
+        self.reset_button = self.control(QPushButton("RESET (restart)"), mod.RESET)
         self.reset_button.clicked.connect(self.reset)
         power_code = lc.POWER_OFF if self.is_lc else c2.KEY
-        self.power_button = self.control(QPushButton("Power off…"), power_code)
+        self.power_button = self.control(set_kind(QPushButton("Power off…"), "danger"),
+                                         power_code)
         self.power_button.clicked.connect(self.power_off)
-        self.body.addWidget(group("Meter", row(self.reset_button, self.power_button)))
-        self.body.addStretch(1)
+        mc.add(row(self.reset_button, self.power_button))
+        mc.add(label("RESET restarts the meter: its port goes and comes back. Power off saves "
+                     "the meter's settings after a backup.", "hint", word_wrap=True))
+        right.addWidget(mc)
+        right.addStretch(1)
         self.releases: list = []
+        self._release_buttons: list = []
         self.show_info(device.info)
-
-    def extra_enabled(self, widget) -> bool:
-        if widget is getattr(self, "install_release", None):
-            return self.release_combo.currentData() is not None
-        return True
 
     # -- INFO / battery -----------------------------------------------------------------------
     def show_info(self, info) -> None:
@@ -214,11 +317,13 @@ class MeterPage(Page):
         L["firmware"].setText(info.firmware)
         L["uid"].setText(info.uid_hex)
         L["serial"].setText(self.port.serial or "none reported by the system")
-        L["port"].setText(self.port.device)
+        L["port"].setText("Connected · %s" % self.port.device)
         L["protocol"].setText(str(info.protocol))
         L["caps"].setText("0x%08X" % info.capabilities)
-        L["slot"].setText(mod.SLOT_NAME.get(info.running_slot, "%d" % info.running_slot))
-        L["slot_version"].setText(str(info.slot_version))
+        L["slot"].setText("%s · v%d" % (mod.SLOT_NAME.get(info.running_slot,
+                                                          "%d" % info.running_slot),
+                                        info.slot_version))
+        L["companion"].setText(getattr(self.ctx, "version", "") or "—")
         L["app_size"].setText("%d bytes" % info.app_size)
         L["update"].setText("%d (%s)" % (info.update_result,
                                          mod.UPDATE_RESULT.get(info.update_result, "?")))
@@ -256,17 +361,16 @@ class MeterPage(Page):
 
         def done(found):
             self.releases = found
-            self.release_combo.clear()
             info = self.dev.info
             installed = self.ctx.settings.installed_release(model, info.uid_hex)
             newer = None
+            rows = []
             for r in found:
                 rel = releases.relation(model, info.firmware, r, installed)
                 if rel == "newer" and newer is None:
                     newer = r
-                self.release_combo.addItem("%s  (%s, %s)" % (r.tag, r.published or "?", rel), r)
-            if not found:
-                self.release_combo.addItem("no releases published", None)
+                rows.append((r, rel))
+            self.show_releases(rows)
             try:
                 self.ctx.settings.mark_release_checked()
             except OSError as e:
@@ -282,11 +386,39 @@ class MeterPage(Page):
         return self.run("release check" + (" (automatic)" if auto else ""),
                         lambda p: releases.list_releases(model, get), done)
 
+    def show_releases(self, rows) -> None:
+        """The release table: version, date, the badge of its relation to the meter, and its
+        Install and Page buttons (Install registered as a command control of the update)."""
+        self.release_rows = list(rows)
+        t = self.release_table
+        for b in self._release_buttons:
+            self._controls = [(c, k) for c, k in self._controls if c is not b]
+        self._release_buttons = []
+        t.setRowCount(0)
+        for r, rel in rows:
+            i = t.rowCount()
+            t.insertRow(i)
+            t.setItem(i, 0, QTableWidgetItem(r.tag))
+            t.setItem(i, 1, QTableWidgetItem(r.published or "?"))
+            text, kind = RELATION_BADGE.get(rel, (rel, "unknown"))
+            t.setCellWidget(i, 2, _cell(Badge(text, kind), Qt.AlignLeft))
+            inst = self.control(set_kind(QPushButton("Install"), "small"), self.update_code)
+            if rel == "newer":
+                set_kind(inst, "primary")
+            inst.setObjectName("install_%s" % r.tag)
+            inst.clicked.connect(lambda _=False, r=r: self.update_from_release(r))
+            page = set_kind(QPushButton("Page"), "small")
+            page.clicked.connect(lambda _=False, r=r: QDesktopServices.openUrl(QUrl(r.page_url)))
+            self._release_buttons.append(inst)
+            t.setCellWidget(i, 3, _cell(inst, Qt.AlignRight, page))
+        t.setVisible(bool(rows))
+        self.no_releases.setVisible(not rows)
+        self.no_releases.setText("no releases published")
+        fit_table(t)
+
     def _open_release_page(self) -> None:
-        r = self.release_combo.currentData()
-        url = r.page_url if r is not None else \
-            "https://github.com/%s/releases" % releases.REPOS[self.dev.model]
-        QDesktopServices.openUrl(QUrl(url))
+        QDesktopServices.openUrl(QUrl("https://github.com/%s/releases"
+                                      % releases.REPOS[self.dev.model]))
 
     # -- updates ------------------------------------------------------------------------------
     def update_from_file(self) -> None:
@@ -295,8 +427,8 @@ class MeterPage(Page):
         if path:
             self.start_update(path, None)
 
-    def update_from_release(self):
-        r = self.release_combo.currentData()
+    def update_from_release(self, r=None):
+        """Downloads release r (verified against its SHA256SUMS) and starts its update."""
         if r is None:
             return None
         get, cache = self.ctx.release_get, self.ctx.cache_dir
@@ -482,23 +614,31 @@ class DrivePage(Page):
         self.drive = drive
         self.slot_meter = slot_meter
         self.why_unknown = why_unknown
-        form = QFormLayout()
-        form.addRow("Model", QLabel("%s in update mode" % drive.model))
-        form.addRow("Drive", QLabel(drive.path))
-        form.addRow("USB", QLabel("%04X:%04X" % (drive.vid, drive.pid)))
-        self.state = QLabel("%s (%s)" % (drive.status, DRIVE_STATUS_TEXT.get(drive.status, "?")))
+        name = label("%s in update mode" % drive.model, "name")
+        sub = label("Update drive · %s" % drive.path, "caption")
+        card, _col = header_card(name, sub)
+        rows = [("Drive", drive.path), ("USB", "%04X:%04X" % (drive.vid, drive.pid))]
+        for title, text in rows:
+            card.add(StatRow(title, text))
+        st = StatRow("Status", "%s (%s)" % (drive.status, DRIVE_STATUS_TEXT.get(drive.status, "?")),
+                     line=drive.status == "unmounted")
+        self.state = st.value
         self.state.setObjectName("drive_status")
-        form.addRow("Status", self.state)
+        card.add(st)
         if drive.status == "unmounted":
-            form.addRow("Mount it", QLabel(lc.MOUNT_COMMAND % drive.path))
-        self.body.addWidget(group("Update drive", form))
-        self.copy_button = self.control(QPushButton("Copy an application file…"))
+            card.add(StatRow("Mount it", lc.MOUNT_COMMAND % drive.path, line=False))
+        self.body.addWidget(card)
+        inst = Card("Install a file")
+        self.copy_button = self.control(set_kind(QPushButton("Copy an application file…"),
+                                                 "danger"))
         self.copy_button.clicked.connect(self.copy_file)
-        self.body.addLayout(row(self.copy_button))
-        self.reason = QLabel(self.refusal() or "")
+        inst.add(row(self.copy_button))
+        self.reason = label(self.refusal() or "", "label", word_wrap=True)
         self.reason.setObjectName("drive_refusal")
-        self.reason.setWordWrap(True)
-        self.body.addWidget(self.reason)
+        inst.add(self.reason)
+        inst.add(label("The meter's bootloader installs a file copied onto its update drive and "
+                       "restarts.", "hint", word_wrap=True))
+        self.body.addWidget(inst)
         self.body.addStretch(1)
 
     def refusal(self) -> str | None:

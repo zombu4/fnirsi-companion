@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 - unreleased
+
+- New look after the 121GW Companion: sidebar with painted icons instead of tabs, a header with firmware, bootloader,
+  port and status chips, cards instead of group boxes, a painted seven-segment LCD on the Live page with the meter's
+  annunciators and keys, segmented controls, dark and light themes from one set of colours (the "system" theme follows
+  the computer), the same Fusion style on macOS, Windows and Linux. The pages' commands, confirmations, backups and
+  jobs are unchanged.
+
 ## 0.1.0 - 2026-11-21
 
 Tested with the LC1020E on the meter (all pages). The 2C53T side is tested against the fake meter of the

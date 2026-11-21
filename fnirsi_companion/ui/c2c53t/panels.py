@@ -1,18 +1,27 @@
-"""2C53T Multimeter and Generator pages (S2 4.3, 4.5, 4.6).
+"""2C53T multimeter controls (the "Multimeter" card of the Live page) and the Generator page
+(S2 4.3, 4.5, 4.6).
 
 Multimeter: DMM_FUNCTION (the 13 functions of S2 4.3), DMM_HOLD, DMM_RELATIVE; the meter page is
 opened with PAGE 1 (the DMM commands answer status 3 elsewhere). The controls and the record view
-follow the STATE record (stream and answers).
+follow the STATE record (stream and answers). The page also gives the Live page's LCD its
+annunciators (DESIGN_UI 6.5): AUTO, .OL, CAL, PAS and Er (Er1, Er2, Er3, ErC) from the status text
+of STATE's multimeter part (Dmm.status_text), and the function name as the mode text.
 Generator: GEN_SET (output, waveform index 0..12 of the meter's list, frequency 1..50000 Hz, duty
 0..100 %, amplitude 1..30 = 0.1..3.0 V); the form shows the generator part of STATE.
 """
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QLabel, QPushButton, QSpinBox)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QPushButton,
+                               QSpinBox)
 
 from ...devices import c2c53t as c2
-from ..base import Page, group, row
+from ..base import Page, row
+from ..widgets import Card, StatRow, label, set_kind
+
+LCD_WORDS = ["AUTO", ".OL", "CAL", "PAS", "Er"]
+STATUS_WORD = {"AUTO": "AUTO", ".OL": ".OL", "CAL": "CAL", "PAS": "PAS", "Er1": "Er",
+               "Er2": "Er", "Er3": "Er", "ErC": "Er"}
 
 
 class MultimeterPage(Page):
@@ -21,35 +30,47 @@ class MultimeterPage(Page):
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
-        self.page_button = self.control(QPushButton("Open the meter page (PAGE 1)"), c2.PAGE)
+        self.state = None
+        card = Card("Multimeter")
+        self.page_button = self.control(set_kind(QPushButton("Open the meter page (PAGE 1)"),
+                                                 "small"), c2.PAGE)
         self.page_button.clicked.connect(lambda: self._send("PAGE 1", lambda: self.dev.page(1)))
+        card.add_right(self.page_button)
         self.function = self.control(QComboBox(), c2.DMM_FUNCTION)
         self.function.setObjectName("dmm_function")
+        self.function.setMinimumWidth(160)
         for i, name in enumerate(c2.DMM_FUNCTION_NAME):
             self.function.addItem(name, i)
         self.function.activated.connect(self._function)
-        self.hold = self.control(QCheckBox("Hold"), c2.DMM_HOLD)
+        self.hold = self.control(QPushButton("Hold"), c2.DMM_HOLD)
+        self.hold.setCheckable(True)
         self.hold.clicked.connect(lambda on: self._toggle("DMM_HOLD", self.dev.dmm_hold, on,
                                                           self.hold))
-        self.relative = self.control(QCheckBox("Relative"), c2.DMM_RELATIVE)
+        self.relative = self.control(QPushButton("Relative"), c2.DMM_RELATIVE)
+        self.relative.setCheckable(True)
         self.relative.clicked.connect(lambda on: self._toggle("DMM_RELATIVE", self.dev.dmm_relative,
                                                               on, self.relative))
-        self.body.addLayout(row(self.page_button))
-        self.body.addLayout(row("Function:", self.function, self.hold, self.relative))
+        card.add(row("Function", self.function, self.hold, self.relative))
         self.fields = {}
-        form = QFormLayout()
-        for key, name in (("page", "Page"), ("function", "Function"), ("status", "Status"),
-                          ("value", "Value (as the meter has it)"), ("decimals", "Decimals"),
-                          ("unit", "Unit (from the function)"), ("shown", "Unit shown"),
-                          ("exponent", "Prefix exponent"), ("length", "Record length")):
-            lab = QLabel("—")
-            lab.setObjectName("dmm_" + key)
-            form.addRow(name, lab)
-            self.fields[key] = lab
-        self.body.addWidget(group("STATE: multimeter", form))
-        self.body.addWidget(QLabel("DMM_RELATIVE is refused by the meter in auto, diode / "
-                                   "continuity, temperature and without a reading (status 3)."))
-        self.body.addStretch(1)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(0)
+        items = (("page", "Page"), ("function", "Function"), ("status", "Status"),
+                 ("value", "Value (as the meter has it)"), ("decimals", "Decimals"),
+                 ("unit", "Unit (from the function)"), ("shown", "Unit shown"),
+                 ("exponent", "Prefix exponent"), ("length", "Record length"))
+        half = (len(items) + 1) // 2
+        for i, (key, name) in enumerate(items):
+            col, r = divmod(i, half)
+            last = r == half - 1 or i == len(items) - 1
+            sr = StatRow(name, line=not last)
+            sr.value.setObjectName("dmm_" + key)
+            grid.addWidget(sr, r, col)
+            self.fields[key] = sr.value
+        card.add(grid)
+        card.add(label("DMM_RELATIVE is refused by the meter in auto, diode / continuity, "
+                       "temperature and without a reading (status 3).", "hint", word_wrap=True))
+        self.body.addWidget(card)
 
     def _send(self, what, call):
         return self.run(what, lambda p: call(), self.ctx.publish_state)
@@ -65,6 +86,7 @@ class MultimeterPage(Page):
     def on_state(self, st) -> None:
         if not isinstance(st, c2.State):
             return
+        self.state = st
         d = st.dmm
         self.function.blockSignals(True)
         self.function.setCurrentIndex(d.function if d.function < len(c2.DMM_FUNCTION_NAME) else -1)
@@ -84,6 +106,14 @@ class MultimeterPage(Page):
         F["length"].setText("%d bytes%s" % (st.length, "" if d.has_si_view else
                                             " (no prefix / status: raw view, DESIGN 13.4)"))
 
+    def lcd_flags(self, _reading) -> tuple[set, str]:
+        """(lit annunciator words, mode text) for the Live page (module docstring)."""
+        st = self.state
+        if st is None:
+            return set(), ""
+        word = STATUS_WORD.get(st.dmm.status_text or "")
+        return ({word} if word else set()), st.dmm.function_name
+
 
 class GeneratorPage(Page):
     title = "Generator"
@@ -91,11 +121,15 @@ class GeneratorPage(Page):
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
-        self.page_button = self.control(QPushButton("Open the generator page (PAGE 3)"), c2.PAGE)
+        card = Card("Signal generator")
+        self.page_button = self.control(set_kind(QPushButton("Open the generator page (PAGE 3)"),
+                                                 "small"), c2.PAGE)
         self.page_button.clicked.connect(
             lambda: self.run("PAGE 3", lambda p: self.dev.page(3), self.ctx.publish_state))
+        card.add_right(self.page_button)
         self.on = QCheckBox("Output on")
         self.waveform = QComboBox()
+        self.waveform.setMinimumWidth(160)
         for i in range(c2.GEN_WAVEFORMS):
             self.waveform.addItem("waveform %d" % i, i)
         self.frequency = QSpinBox()
@@ -107,20 +141,30 @@ class GeneratorPage(Page):
         self.amplitude = QSpinBox()
         self.amplitude.setRange(1, 30)
         self.amplitude.setSuffix(" × 0.1 V")
-        self.apply_button = self.control(QPushButton("GEN_SET"), c2.GEN_SET)
+        for sb in (self.frequency, self.duty, self.amplitude):
+            sb.setMinimumWidth(160)
+        self.apply_button = self.control(set_kind(QPushButton("GEN_SET"), "primary"), c2.GEN_SET)
         self.apply_button.clicked.connect(self.apply)
-        form = QFormLayout()
-        form.addRow(self.on)
-        form.addRow("Waveform (index in the meter's list)", self.waveform)
-        form.addRow("Frequency", self.frequency)
-        form.addRow("Duty", self.duty)
-        form.addRow("Amplitude", self.amplitude)
-        form.addRow(self.apply_button)
-        self.body.addLayout(row(self.page_button))
-        self.body.addWidget(group("Signal generator", form))
-        self.shown = QLabel("—")
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(10)
+        g.setColumnStretch(2, 1)
+        g.addWidget(self.on, 0, 0, 1, 2)
+        for r, (name, w) in enumerate((("Waveform (index in the meter's list)", self.waveform),
+                                       ("Frequency", self.frequency), ("Duty", self.duty),
+                                       ("Amplitude", self.amplitude)), start=1):
+            g.addWidget(label(name), r, 0)
+            g.addWidget(w, r, 1)
+        card.add(g)
+        b = QHBoxLayout()
+        b.addWidget(self.apply_button)
+        b.addStretch(1)
+        card.add(b)
+        shown_row = StatRow("Meter", line=False)
+        self.shown = shown_row.value
         self.shown.setObjectName("gen_state")
-        self.body.addLayout(row("Meter:", self.shown))
+        card.add(shown_row)
+        self.body.addWidget(card)
         self.body.addStretch(1)
         self.edits("gen", self.on, self.waveform, self.frequency, self.duty, self.amplitude)
 

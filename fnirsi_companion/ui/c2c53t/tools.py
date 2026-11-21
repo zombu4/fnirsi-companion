@@ -4,18 +4,22 @@ Settings (S2 4.8): SETTINGS_GET / SETTINGS_SET (RAM only; the form shows the set
 answers) and SETTINGS_SAVE (the meter writes its settings page and restarts; the settings /
 calibration page is backed up first and the typed "OK" is needed, DESIGN 13.1).
 Keys (S2 4.7): key codes 1..23 with the functions S2 lists per page; key 1 powers the meter off and
-saves its settings, so it needs the backup and the typed "OK".
+saves its settings, so it needs the backup and the typed "OK". The page is the Keys card of the
+Diagnostics view; its row of the keys with a meaning on the meter page is shown on the Live page.
 Diagnostics (DESIGN 13.6): PING, STATE, PAGE, KEEP_AWAKE, CAL_READ, MEM_READ with the fault record,
 FLASH_READ, METER_LOG, FLASH_ID, METER_SEND (backup + typed "OK", 13.7), TEXT_COLOUR.
 """
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import (QComboBox, QFormLayout, QGridLayout, QLabel, QLineEdit,
-                               QPushButton, QSpinBox, QVBoxLayout)
+from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLineEdit, QPushButton, QSpinBox,
+                               QWidget)
 
 from ...devices import c2c53t as c2
-from ..base import Page, group, hexdump, mono_text, row
+from ..base import Page, hexdump, mono_text, row
+from ..widgets import Card, FlowLayout, KeyButton, KeyRow, Segmented, StatRow, label, set_kind
+
+LONG_PRESS_FROM = 16       # key codes 16..23 are the long presses (S2 4.7)
 
 
 class C2SettingsPage(Page):
@@ -28,27 +32,43 @@ class C2SettingsPage(Page):
         self.backlight.setRange(25, 100)
         self.sound = QSpinBox()
         self.sound.setRange(0, 10)
-        self.shutdown = QComboBox()
-        self.shutdown.addItems(["0 off", "1 (the menu's first time)", "2 (second time)",
-                                "3 (third time)"])
-        self.startup = QComboBox()
-        self.startup.addItems(["0 (the menu's first entry)", "1 (second entry)", "2 (third entry)"])
-        self.read_button = self.control(QPushButton("SETTINGS_GET"), c2.SETTINGS_GET)
+        for sb in (self.backlight, self.sound):
+            sb.setMinimumWidth(110)
+            sb.setMaximumWidth(160)
+        self.shutdown = Segmented(["0 off", "1 (the menu's first time)", "2 (second time)",
+                                   "3 (third time)"])
+        self.startup = Segmented(["0 (the menu's first entry)", "1 (second entry)",
+                                  "2 (third entry)"])
+        self.read_button = self.control(set_kind(QPushButton("SETTINGS_GET"), "small"),
+                                        c2.SETTINGS_GET)
         self.read_button.clicked.connect(self.read)
         self.set_button = self.control(QPushButton("SETTINGS_SET (RAM)"), c2.SETTINGS_SET)
         self.set_button.clicked.connect(self.apply)
-        self.save_button = self.control(QPushButton("SETTINGS_SAVE…"), c2.SETTINGS_SAVE)
+        self.save_button = self.control(set_kind(QPushButton("SETTINGS_SAVE…"), "danger"),
+                                        c2.SETTINGS_SAVE)
         self.save_button.clicked.connect(self.save)
-        form = QFormLayout()
-        form.addRow("Backlight (25..100)", self.backlight)
-        form.addRow("Sound (0..10)", self.sound)
-        form.addRow("Auto shutdown", self.shutdown)
-        form.addRow("Startup option", self.startup)
-        form.addRow(row(self.read_button, self.set_button, self.save_button))
-        self.body.addWidget(group("Settings of the meter", form))
-        self.shown = QLabel("—")
+        card = Card("Settings of the meter")
+        card.add_right(self.read_button)
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(10)
+        g.setColumnStretch(2, 1)
+        for r, (name, w) in enumerate((("Backlight (25..100)", self.backlight),
+                                       ("Sound (0..10)", self.sound),
+                                       ("Auto shutdown", self.shutdown),
+                                       ("Startup option", self.startup))):
+            g.addWidget(label(name), r, 0)
+            g.addWidget(w, r, 1)
+        card.add(g)
+        card.add(row(self.set_button, self.save_button))
+        shown_row = StatRow("Meter", line=False)
+        self.shown = shown_row.value
         self.shown.setObjectName("c2_settings")
-        self.body.addLayout(row("Meter:", self.shown))
+        card.add(shown_row)
+        card.add(label("SETTINGS_SET changes RAM only; SETTINGS_SAVE writes the settings page and "
+                       "restarts the meter, after a backup of the settings / calibration page.",
+                       "hint", word_wrap=True))
+        self.body.addWidget(card)
         self.body.addStretch(1)
         if device.has(c2.SETTINGS_GET):
             self.read()
@@ -115,29 +135,69 @@ KEY_TABLE = {
 }
 
 
+def meter_meaning(text: str) -> str | None:
+    """The part of a KEY_TABLE text that names the key's function on the meter page ("meter:
+    hold" -> "hold"), or None when the table lists none."""
+    for part in text.split(";"):
+        if ":" not in part:
+            continue
+        pages, what = part.split(":", 1)
+        if "meter" in [p.strip() for p in pages.split(",")]:
+            return what.strip()
+    return None
+
+
 class C2KeysPage(Page):
     title = "Keys"
     status_names = c2.STATUS_NAME
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
+        card = Card("Keys")
+        card.add(label("Key codes 1..15 are short presses, 16..23 long presses (S2 4.7). Key 1 "
+                       "switches the meter off and saves its settings: backup and typed OK "
+                       "first.", "hint", word_wrap=True))
         grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
         self.buttons = {}
         for code in range(c2.KEY_MIN, c2.KEY_MAX + 1):
             b = self.control(QPushButton("%d%s" % (code, "…" if code == c2.KEY_POWER_OFF else "")),
                              c2.KEY)
+            if code == c2.KEY_POWER_OFF:
+                set_kind(b, "danger")
             b.setObjectName("key_%d" % code)
+            b.setFixedWidth(54)
             b.clicked.connect(lambda _=False, c=code: self.press(c))
-            lab = QLabel(KEY_TABLE.get(code, "no function listed in S2 4.7"))
-            lab.setWordWrap(True)
+            lab = label(KEY_TABLE.get(code, "no function listed in S2 4.7"),
+                        "label" if code in KEY_TABLE else "hint", word_wrap=True)
             r = code - 1
             grid.addWidget(b, r % 12, (r // 12) * 2)
             grid.addWidget(lab, r % 12, (r // 12) * 2 + 1)
             self.buttons[code] = b
-        self.body.addWidget(group("Key codes (1..15 short press, 16..23 long press; S2 4.7)", grid))
-        self.answer = QLabel("—")
-        self.body.addLayout(row("Meter after the key:", self.answer))
-        self.body.addStretch(1)
+        card.add(grid)
+        answer_row = StatRow("Meter after the key", line=False)
+        self.answer = answer_row.value
+        card.add(answer_row)
+        self.body.addWidget(card)
+
+        # the Live page's row: the keys with a function on the meter page (key 1, power off on
+        # every page, stays on the Keys card with its confirmation)
+        self.live_buttons = {}
+        for code, text in KEY_TABLE.items():
+            what = meter_meaning(text)
+            if what is None:
+                continue
+            k = self.control(KeyButton(what, "long press" if code >= LONG_PRESS_FROM else ""),
+                             c2.KEY)
+            k.setObjectName("live_key_%d" % code)
+            k.setToolTip("key %d: %s" % (code, text))
+            k.clicked.connect(lambda _=False, c=code: self.press(c))
+            self.live_buttons[code] = k
+        self.live_keys = KeyRow(list(self.live_buttons.values()))
+        self.extras.append(self.live_keys)
 
     def press(self, code: int):
         dev = self.dev
@@ -171,22 +231,28 @@ class C2DiagnosticsPage(Page):
         super().__init__(ctx, device)
         self.out = mono_text()
         self.out.setObjectName("diag_out")
+        self.out.setMinimumHeight(240)
         self.ping_text = QLineEdit("FNIRSI")
+        self.ping_text.setMaximumWidth(200)
         self.ping_button = self._b("PING", c2.PING, self.ping)
         self.state_button = self._b("STATE", c2.STATE, self.state)
-        self.page_combo = QComboBox()
+        self.page_combo = Segmented()
         for n in (0, 1, 2, 3):
             self.page_combo.addItem(c2.PAGE_NAME[n], n)
         self.page_button = self._b("PAGE", c2.PAGE, self.page)
         self.awake_on = self._b("KEEP_AWAKE on", c2.KEEP_AWAKE, lambda: self.keep_awake(True))
         self.awake_off = self._b("KEEP_AWAKE off", c2.KEEP_AWAKE, lambda: self.keep_awake(False))
-        dev_box = QVBoxLayout()
-        dev_box.addLayout(row("Bytes:", self.ping_text, self.ping_button, self.state_button))
-        dev_box.addLayout(row("Page:", self.page_combo, self.page_button, self.awake_on,
-                              self.awake_off))
-        self.body.addWidget(group("Device", dev_box))
+        devc = Card("Device")
+        devc.add(row("Bytes", self.ping_text, self.ping_button, self.state_button))
+        devc.add(row("Page", self.page_combo, self.page_button))
+        devc.add(row(self.awake_on, self.awake_off))
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        self.body.addLayout(top)
+        top.addWidget(devc, 1)
 
         self.addr = QLineEdit("0x08000000")
+        self.addr.setMaximumWidth(160)
         self.length = QSpinBox()
         self.length.setRange(1, 65536)
         self.length.setValue(256)
@@ -195,15 +261,18 @@ class C2DiagnosticsPage(Page):
         self.fault_button = self._b("Fault record", c2.MEM_READ, self.fault)
         self.flash_button = self._b("FLASH_READ (SPI flash)", c2.FLASH_READ, self.flash_read)
         self.flash_id_button = self._b("FLASH_ID", c2.FLASH_ID, self.flash_id)
-        mem = QFormLayout()
-        mem.addRow("Address", self.addr)
-        mem.addRow("Length", self.length)
-        mem.addRow(row(self.mem_button, self.fault_button, self.flash_button, self.flash_id_button,
-                       self.cal_button))
-        mem.addRow(QLabel("MEM_READ: internal flash 0x08000000..0x080FFFFF and RAM "
-                          "0x20037FB0..0x20037FFF; FLASH_READ: drive 3: from 0, drive 2: from "
-                          "0x200000, at most 16 MB (S2 4.13)."))
-        self.body.addWidget(group("Memory", mem))
+        mem = Card("Memory")
+        mem.add(row("Address", self.addr, "Length", self.length))
+        flow_w = QWidget()
+        flow = FlowLayout(flow_w, spacing=8)
+        for b in (self.mem_button, self.fault_button, self.flash_button, self.flash_id_button,
+                  self.cal_button):
+            flow.addWidget(b)
+        mem.add(flow_w)
+        mem.add(label("MEM_READ: internal flash 0x08000000..0x080FFFFF and RAM "
+                      "0x20037FB0..0x20037FFF; FLASH_READ: drive 3: from 0, drive 2: from "
+                      "0x200000, at most 16 MB (S2 4.13).", "hint", word_wrap=True))
+        top.addWidget(mem, 1)
 
         self.log_start = self._b("METER_LOG start", c2.METER_LOG, self.log_on)
         self.log_stop = self._b("METER_LOG stop", c2.METER_LOG, self.log_off)
@@ -213,14 +282,18 @@ class C2DiagnosticsPage(Page):
         self.m0 = QSpinBox()
         self.m0.setRange(0, 255)
         self.send_button = self._b("METER_SEND…", c2.METER_SEND, self.meter_send)
+        set_kind(self.send_button, "danger")
         self.colour = QLineEdit("0x0000")
+        self.colour.setMaximumWidth(120)
         self.colour_button = self._b("TEXT_COLOUR", c2.TEXT_COLOUR, self.text_colour)
-        chip = QVBoxLayout()
-        chip.addLayout(row(self.log_start, self.log_stop, self.log_read))
-        chip.addLayout(row("m1", self.m1, "m0", self.m0, self.send_button))
-        chip.addLayout(row("RGB565 (0 default, 0xFFFF white):", self.colour, self.colour_button))
-        self.body.addWidget(group("Multimeter chip and display", chip))
-        self.body.addWidget(self.out, 1)
+        chip = Card("Multimeter chip and display")
+        chip.add(row(self.log_start, self.log_stop, self.log_read))
+        chip.add(row("m1", self.m1, "m0", self.m0, self.send_button))
+        chip.add(row("RGB565 (0 default, 0xFFFF white)", self.colour, self.colour_button))
+        self.body.addWidget(chip)
+        out = Card("Output")
+        out.add(self.out, 1)
+        self.body.addWidget(out, 1)
 
     def _b(self, text, code, slot) -> QPushButton:
         b = self.control(QPushButton(text), code)

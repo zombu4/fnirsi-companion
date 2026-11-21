@@ -23,15 +23,22 @@ name.
 
 ## Pages
 
-- **Live**: the reading, the secondary reading, its validity, statistics (min, max, mean, standard deviation, count).
-- **Trend**: the readings over time as a plot.
+The window has a sidebar with one item per page (Ctrl+1..9 switch them), a header with the meter's firmware,
+bootloader, port and status chips, and a status line with the last message and the link counters.
+
+- **Live**: the reading on a seven-segment display as the meter shows it (annunciators, quantity, the LC1020E's
+  secondary reading), the meter's keys, the model's measurement controls (LC1020E: the LCR lists, HOLD and the screen;
+  2C53T: the multimeter function, hold and relative), statistics (min, max, mean, standard deviation, count), a limit
+  test, the recording and the last 10 minutes of the trend.
+- **Trend**: the readings over time as a plot, with time window, auto or fixed scale and two cursors.
 - **Log**: record to CSV, with triggers (every reading, interval, change, limit).
-- **Meter**: model, firmware text, serial, bootloader, last update result; firmware update from a file or from the
-  GitHub releases of the firmware repositories.
-- **Screenshot**: capture the meter's screen and save it as PNG.
-- **Preferences**: recordings folder, CSV separator, update check, theme.
-- 2C53T pages: Multimeter, Oscilloscope, Generator, Files, Settings, Keys, Events.
-- LC1020E pages: LCR, Compare, Settings, Calibration, Backup, Keys, Events.
+- **Meter**: model, firmware text, serial, bootloader, last update result, battery; firmware update from a file or from
+  the GitHub releases of the firmware repositories; RESET and power off.
+- **Screen**: capture the meter's screen and save it as PNG.
+- **Diagnostics**: the model's diagnostic commands, the table of all meter keys and the event list.
+- **Settings**: folders, CSV format, connection, release check, theme (system, dark, light).
+- 2C53T pages: Oscilloscope, Generator, Files, Meter settings.
+- LC1020E pages: Compare, Meter settings (settings, calibration, backup and restore).
 
 ## Install
 

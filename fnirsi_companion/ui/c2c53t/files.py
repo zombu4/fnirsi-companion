@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import os
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QHeaderView, QLineEdit, QPushButton, QTableWidget,
                                QTableWidgetItem)
 
 from ...devices import c2c53t as c2
 from ..base import Page, row
+from ..common.data_pages import fit_table, setup_table
+from ..widgets import Card, label, set_kind
 
 ATTR_DIRECTORY = 0x10        # FAT directory attribute bit of the FILE_LIST entry
 
@@ -46,30 +49,45 @@ class FilesPage(Page):
         self.drive3_button = self.control(QPushButton("3:/System file"), c2.FILE_LIST)
         self.drive3_button.clicked.connect(lambda: (self.dir.setText("3:/System file"),
                                                     self.list_dir()))
-        self.body.addLayout(row("Directory:", self.dir, self.list_button, self.up_button,
-                                self.drive3_button))
+        set_kind(self.list_button, "primary")
+        bar = Card()
+        bar.add(row(self.dir, self.list_button, self.up_button, self.drive3_button,
+                    stretch=False))
+        self.body.addWidget(bar)
         self.table = QTableWidget(0, 3)
         self.table.setObjectName("files")
-        self.table.setHorizontalHeaderLabels(["Name", "Size", "Attribute"])
+        self.table.setHorizontalHeaderLabels(["Name", "Size B", "Attribute"])
+        setup_table(self.table)
+        self.table.setFocusPolicy(Qt.StrongFocus)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.cellDoubleClicked.connect(self._open)
         self.table.itemSelectionChanged.connect(self.refresh_controls)
-        self.body.addWidget(self.table, 1)
         self.read_button = self.control(QPushButton("Read to the computer…"), c2.FILE_READ)
         self.read_button.clicked.connect(self.read_selected)
         self.write_button = self.control(QPushButton("Write a file here…"), c2.FILE_WRITE)
         self.write_button.clicked.connect(self.write_file)
-        self.delete_button = self.control(QPushButton("Delete…"), c2.FILE_DELETE)
+        self.delete_button = self.control(set_kind(QPushButton("Delete…"), "danger"),
+                                          c2.FILE_DELETE)
         self.delete_button.clicked.connect(self.delete_selected)
-        self.share_button = self.control(QPushButton("Share the drive with the computer…"),
-                                         c2.DRIVE)
+        files = Card("Files")
+        self.files_card = files
+        files.add(self.table)
+        files.add(row(self.read_button, self.write_button, self.delete_button))
+        files.add(label("Double-click a directory to open it. The start-up files of drive 2: "
+                        "are never written or deleted; drive 3: takes only the pictures "
+                        "3:/System file/N.jpg.", "hint", word_wrap=True))
+        self.body.addWidget(files)
+        self.share_button = self.control(set_kind(QPushButton("Share the drive with the "
+                                                              "computer…"), "danger"), c2.DRIVE)
         self.share_button.clicked.connect(lambda: self.share(True))
         self.unshare_button = self.control(QPushButton("End drive sharing"), c2.DRIVE)
         self.unshare_button.clicked.connect(lambda: self.share(False))
-        self.body.addLayout(row(self.read_button, self.write_button, self.delete_button))
-        self.body.addLayout(row(self.share_button, self.unshare_button))
+        share = Card("Drive sharing")
+        share.add(row(self.share_button, self.unshare_button))
+        share.add(label("DRIVE shares drive 2: with this computer; eject it on the computer "
+                        "before the sharing ends (S2 4.10).", "hint", word_wrap=True))
+        self.body.addWidget(share)
+        self.body.addStretch(1)
 
     def extra_enabled(self, widget) -> bool:
         if widget is getattr(self, "read_button", None):
@@ -100,7 +118,12 @@ class FilesPage(Page):
             for i, e in enumerate(entries):
                 for col, text in enumerate((e.name + ("/" if e.attribute & ATTR_DIRECTORY else ""),
                                             str(e.size), "0x%02X" % e.attribute)):
-                    self.table.setItem(i, col, QTableWidgetItem(text))
+                    it = QTableWidgetItem(text)
+                    if col == 1:
+                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.table.setItem(i, col, it)
+            fit_table(self.table)
+            self.files_card.set_title("Files · %s · %d entries" % (cp, len(entries)))
             self.refresh_controls()
             self.say("%s: %d entries" % (cp, len(entries)))
 

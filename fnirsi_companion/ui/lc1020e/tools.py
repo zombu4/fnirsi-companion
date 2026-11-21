@@ -10,11 +10,11 @@ types 1..10 (the factory resistor references, accepted by the meter in factory m
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import (QFormLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
-                               QSpinBox, QVBoxLayout)
+from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QLineEdit, QPushButton, QSpinBox
 
 from ...devices import lc1020e as lc
-from ..base import Page, group, hexdump, mono_text, row
+from ..base import Page, hexdump, mono_text, row
+from ..widgets import Card, KeyButton, KeyRow, StatRow, label, set_kind
 from .storage import run_calibration
 
 # SL 7.1: (pin, measure screen, settings screen)
@@ -40,6 +40,16 @@ KEYS = {
     13: ("PE0", "cursor to FREQ, then step it", ""),
 }
 
+# The Live page's key row (DESIGN_UI 6.10): the keys whose measure-screen meaning above has a
+# short-press part, labelled with the words of that meaning; the second line is its long-press
+# part. Keys 0 and 3 act on the measure screen only when held, so they are on the Keys card only.
+LIVE_KEYS = {
+    9: ("Func +1", ""), 6: ("secondary +1", ""), 13: ("FREQ", ""), 11: ("AMP", ""),
+    8: ("BIAS", ""), 7: ("RANGE", ""), 12: ("speed +1", "long: circuit mode +1"),
+    10: ("hold", "long: compare screen"), 2: ("cursor +1", ""), 4: ("cursor -1", ""),
+    1: ("value +1", ""), 5: ("value -1", ""),
+}
+
 
 class LcKeysPage(Page):
     title = "Keys"
@@ -47,15 +57,20 @@ class LcKeysPage(Page):
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
+        card = Card("Keys")
         self.hold_ms = QSpinBox()
         self.hold_ms.setRange(0, 65535)
         self.hold_ms.setSuffix(" ms")
-        self.body.addLayout(row("Hold time (0: short press; from 1000 ms on: a hold):",
-                                self.hold_ms))
+        self.hold_ms.setMinimumWidth(110)
+        card.add(row("Hold time", self.hold_ms,
+                     label("0: a short press; from 1000 ms on: a hold (SL 7.1)", "hint")))
         grid = QGridLayout()
-        grid.addWidget(QLabel("Key"), 0, 0)
-        grid.addWidget(QLabel("Measure screen"), 0, 1)
-        grid.addWidget(QLabel("Settings screen"), 0, 2)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        for col, text in enumerate(("Key", "Measure screen", "Settings screen")):
+            grid.addWidget(label(text, "caption"), 0, col)
         self.buttons = {}
         for bit, (pin, meas, sett) in KEYS.items():
             b = self.control(QPushButton("bit %d  0x%04X  %s" % (bit, 1 << bit, pin)), lc.KEY)
@@ -63,19 +78,29 @@ class LcKeysPage(Page):
             b.clicked.connect(lambda _=False, bit=bit: self.press(bit))
             grid.addWidget(b, bit + 1, 0)
             for col, text in ((1, meas), (2, sett)):
-                lab = QLabel(text)
-                lab.setWordWrap(True)
-                grid.addWidget(lab, bit + 1, col)
+                grid.addWidget(label(text, "label", word_wrap=True), bit + 1, col)
             self.buttons[bit] = b
-        self.body.addWidget(group("Keys (SL 7.1)", grid))
-        self.answer = QLabel("—")
-        self.answer.setWordWrap(True)
-        self.body.addLayout(row("Meter state after the key:", self.answer))
-        self.body.addStretch(1)
+        card.add(grid)
+        answer_row = StatRow("Meter state after the key", line=False)
+        self.answer = answer_row.value
+        card.add(answer_row)
+        self.body.addWidget(card)
 
-    def press(self, bit: int):
+        # the Live page's row of keys: a short press each, the meaning as tooltip
+        self.live_buttons = {}
+        for bit, (text, sub) in LIVE_KEYS.items():
+            k = self.control(KeyButton(text, sub), lc.KEY)
+            k.setObjectName("live_key_%d" % bit)
+            k.setToolTip("%s (bit %d, %s): %s" % (text, bit, KEYS[bit][0], KEYS[bit][1]))
+            k.clicked.connect(lambda _=False, bit=bit: self.press(bit, 0))
+            self.live_buttons[bit] = k
+        self.live_keys = KeyRow(list(self.live_buttons.values()))
+        self.extras.append(self.live_keys)
+
+    def press(self, bit: int, ms: int | None = None):
+        """KEY: bit, held `ms` milliseconds (None: the hold time of the Keys card)."""
         dev = self.dev
-        ms = self.hold_ms.value()
+        ms = self.hold_ms.value() if ms is None else ms
 
         def done(st):
             self.ctx.publish_state(st)
@@ -99,7 +124,9 @@ class LcDiagnosticsPage(Page):
         self.out = mono_text()
         self.out.setObjectName("diag_out")
 
+        self.out.setMinimumHeight(240)
         self.ping_text = QLineEdit("FNIRSI")
+        self.ping_text.setMaximumWidth(220)
         self.ping_button = self.control(QPushButton("PING"), lc.PING)
         self.ping_button.clicked.connect(self.ping)
         self.state_button = self.control(QPushButton("STATE"), lc.STATE)
@@ -108,37 +135,45 @@ class LcDiagnosticsPage(Page):
         self.factory_button.clicked.connect(self.factory)
         self.measure_button = self.control(QPushButton("MEASURE (single)"), lc.MEASURE)
         self.measure_button.clicked.connect(self.measure)
-        box = QVBoxLayout()
-        box.addLayout(row("Bytes:", self.ping_text, self.ping_button))
-        box.addLayout(row(self.state_button, self.factory_button, self.measure_button))
-        self.body.addWidget(group("Device", box))
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        self.body.addLayout(top)
+        devc = Card("Device")
+        devc.add(row("Bytes", self.ping_text, self.ping_button))
+        devc.add(row(self.state_button, self.factory_button, self.measure_button))
+        devc.body.addStretch(1)
+        top.addWidget(devc, 1)
 
         self.addr = QLineEdit("0x08000000")
+        self.addr.setMaximumWidth(160)
         self.length = QSpinBox()
         self.length.setRange(1, 256)
         self.length.setValue(64)
         self.mem_button = self.control(QPushButton("MEM_READ"), lc.MEM_READ)
         self.mem_button.clicked.connect(self.mem_read)
-        m = QFormLayout()
-        m.addRow("Address", self.addr)
-        m.addRow("Length", self.length)
-        m.addRow(self.mem_button)
-        m.addRow(QLabel("Flash 0x08000000..0x0807FFFF, system memory 0x1FFF0000..0x1FFF3FFF, "
-                        "configuration / option bytes 0x1FFFF000..0x1FFFF811, RAM "
-                        "0x20000000..0x2001FFFF (SL 5.5); else status 2."))
-        self.body.addWidget(group("Memory", m))
+        mem = Card("Memory")
+        mem.add(row("Address", self.addr, "Length", self.length, self.mem_button))
+        mem.add(label("Flash 0x08000000..0x0807FFFF, system memory 0x1FFF0000..0x1FFF3FFF, "
+                      "configuration / option bytes 0x1FFFF000..0x1FFFF811, RAM "
+                      "0x20000000..0x2001FFFF (SL 5.5); else status 2.", "hint", word_wrap=True))
+        mem.body.addStretch(1)
+        top.addWidget(mem, 1)
 
         self.cal_type = QSpinBox()
         self.cal_type.setRange(1, 10)
-        self.cal_button = self.control(QPushButton("CALIBRATE…"), lc.CALIBRATE)
+        self.cal_button = self.control(set_kind(QPushButton("CALIBRATE…"), "danger"),
+                                       lc.CALIBRATE)
         self.cal_button.clicked.connect(self.calibrate)
-        self.cal_result = QLabel("—")
-        self.cal_result.setWordWrap(True)
-        c = QVBoxLayout()
-        c.addLayout(row("Type (factory reference):", self.cal_type, self.cal_button))
-        c.addWidget(self.cal_result)
-        self.body.addWidget(group("Factory calibration (factory mode only, SL 5.3.3)", c))
-        self.body.addWidget(self.out, 1)
+        cal = Card("Factory calibration")
+        cal.add(row("Type (factory reference)", self.cal_type, self.cal_button))
+        res_row = StatRow("Result", line=False)
+        self.cal_result = res_row.value
+        cal.add(res_row)
+        cal.add(label("Factory mode only (SL 5.3.3).", "hint"))
+        self.body.addWidget(cal)
+        out = Card("Output")
+        out.add(self.out, 1)
+        self.body.addWidget(out, 1)
 
     def _show(self, title: str, text: str) -> None:
         self.out.setPlainText("%s\n%s" % (title, text))

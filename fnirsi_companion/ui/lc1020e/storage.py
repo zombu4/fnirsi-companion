@@ -16,10 +16,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtWidgets import (QComboBox, QGridLayout, QLabel, QListWidget, QListWidgetItem,
-                               QPushButton, QSpinBox, QVBoxLayout)
+                               QPushButton, QSpinBox)
 
 from ...devices import lc1020e as lc
-from ..base import Page, describe_error, group, row
+from ..base import Page, describe_error, row
+from ..widgets import Card, Segmented, StatRow, label, set_kind
+
+SEGMENTED_MAX = 6            # settings of up to this many choices get a segmented control
+LIST_MAX_H = 320             # the backup list scrolls inside its card above this height
 
 
 class LcSettingsPage(Page):
@@ -31,14 +35,24 @@ class LcSettingsPage(Page):
         self.settings: dict[int, lc.Setting] = {}
         self.editors: dict[int, object] = {}
         self.current: dict[int, QLabel] = {}
-        self.grid = QGridLayout()
-        self.body.addWidget(group("Settings of the meter (SETTINGS_SET changes RAM only)", self.grid))
-        self.reload_button = self.control(QPushButton("Read the settings again"), lc.SETTINGS_TABLES)
+        card = Card("Settings")
+        self.reload_button = self.control(set_kind(QPushButton("Read the settings again"),
+                                                   "small"), lc.SETTINGS_TABLES)
         self.reload_button.clicked.connect(self.load)
-        self.save_button = self.control(QPushButton("SETTINGS_SAVE…"), lc.SETTINGS_SAVE)
+        card.add_right(self.reload_button)
+        card.add(label("Each setting as the meter lists it; Set changes it in RAM "
+                       "(SETTINGS_SET), SETTINGS_SAVE writes them into the meter's flash.",
+                       "hint", word_wrap=True))
+        self.grid = QGridLayout()
+        self.grid.setHorizontalSpacing(12)
+        self.grid.setVerticalSpacing(8)
+        self.grid.setColumnStretch(3, 1)
+        card.add(self.grid)
+        self.save_button = self.control(set_kind(QPushButton("SETTINGS_SAVE…"), "danger"),
+                                        lc.SETTINGS_SAVE)
         self.save_button.clicked.connect(self.save)
-        self.body.addLayout(row(self.reload_button, self.save_button))
-        self.body.addStretch(1)
+        card.add(row(self.save_button))
+        self.body.addWidget(card)
         if device.has(lc.SETTINGS_TABLES):
             self.load()
 
@@ -70,28 +84,30 @@ class LcSettingsPage(Page):
         names = [st.name for _, st in items if not isinstance(st, Exception)]
         for r, (sid, st) in enumerate(items):
             if isinstance(st, Exception):
-                self.grid.addWidget(QLabel("setting %d" % sid), r, 0)
-                self.grid.addWidget(QLabel("not answered: %s" % describe_error(st, lc.STATUS_NAME)),
-                                    r, 1)
+                self.grid.addWidget(label("setting %d" % sid), r, 0)
+                self.grid.addWidget(label("not answered: %s" % describe_error(st, lc.STATUS_NAME),
+                                          "hint", word_wrap=True), r, 1, 1, 3)
                 continue
             self.settings[sid] = st
-            self.grid.addWidget(QLabel(st.name if names.count(st.name) == 1
-                                       else "%s (setting %d)" % (st.name, sid)), r, 0)
+            self.grid.addWidget(label(st.name if names.count(st.name) == 1
+                                      else "%s (setting %d)" % (st.name, sid)), r, 0)
             if st.kind == 0:
-                ed = QComboBox()
+                ed = Segmented() if len(st.choices) <= SEGMENTED_MAX else QComboBox()
                 for i, text in enumerate(st.choices):
                     ed.addItem(text, st.min + i * st.step)
             else:
                 ed = QSpinBox()
                 ed.setRange(st.min, st.max)
                 ed.setSingleStep(max(st.step, 1))
+                ed.setMinimumWidth(110)
+                ed.setMaximumWidth(160)
             ed.setObjectName("setting_%d" % sid)
             self.grid.addWidget(ed, r, 1)
-            btn = self.control(QPushButton("Set"), lc.SETTINGS_SET)
+            btn = self.control(set_kind(QPushButton("Set"), "small"), lc.SETTINGS_SET)
             btn.setObjectName("setting_set_%d" % sid)
             btn.clicked.connect(lambda _=False, sid=sid: self.set_value(sid))
             self.grid.addWidget(btn, r, 2)
-            cur = QLabel("")
+            cur = label("", "mono")
             self.grid.addWidget(cur, r, 3)
             self.editors[sid] = ed
             self.current[sid] = cur
@@ -102,7 +118,7 @@ class LcSettingsPage(Page):
         self.settings[st.id] = st
         ed = self.editors[st.id]
         ed.blockSignals(True)
-        if isinstance(ed, QComboBox):
+        if isinstance(ed, (QComboBox, Segmented)):
             ed.setCurrentIndex(ed.findData(st.current))
             text = ed.currentText() if ed.currentIndex() >= 0 else str(st.current)
         else:
@@ -113,7 +129,7 @@ class LcSettingsPage(Page):
 
     def value_of(self, sid: int) -> int:
         ed = self.editors[sid]
-        return ed.currentData() if isinstance(ed, QComboBox) else ed.value()
+        return ed.currentData() if isinstance(ed, (QComboBox, Segmented)) else ed.value()
 
     def set_value(self, sid: int):
         dev = self.dev
@@ -158,24 +174,25 @@ class CalibrationPage(Page):
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
-        self.open_button = self.control(QPushButton("Open calibration (type 11)…"), lc.CALIBRATE)
+        self.open_button = self.control(set_kind(QPushButton("Open calibration (type 11)…"),
+                                                 "danger"), lc.CALIBRATE)
         self.open_button.clicked.connect(lambda: self.calibrate(11))
-        self.short_button = self.control(QPushButton("Short calibration (type 0)…"), lc.CALIBRATE)
+        self.short_button = self.control(set_kind(QPushButton("Short calibration (type 0)…"),
+                                                  "danger"), lc.CALIBRATE)
         self.short_button.clicked.connect(lambda: self.calibrate(0))
-        self.progress = QLabel("—")
+        card = Card("Calibration")
+        card.add(row(self.open_button, self.short_button))
+        r_prog = StatRow("Progress (CALIBRATION events)")
+        r_res = StatRow("Result", line=False)
+        self.progress, self.result = r_prog.value, r_res.value
         self.progress.setObjectName("cal_progress")
-        self.result = QLabel("—")
         self.result.setObjectName("cal_result")
-        self.result.setWordWrap(True)
-        box = QVBoxLayout()
-        box.addLayout(row(self.open_button, self.short_button))
-        box.addLayout(row("Progress (CALIBRATION events):", self.progress))
-        box.addLayout(row("Result:", self.result))
-        box.addWidget(QLabel("The meter runs its own calibration procedure and saves the result "
-                             "itself (SL 5.3.3). Types 1..10 (factory references, factory mode "
-                             "only) are on the Diagnostics page."))
-        self.body.addWidget(group("CALIBRATE", box))
-        self.body.addStretch(1)
+        card.add(r_prog)
+        card.add(r_res)
+        card.add(label("The meter runs its own calibration procedure and saves the result itself "
+                       "(SL 5.3.3). Types 1..10 (factory references, factory mode only) are on "
+                       "the Diagnostics page.", "hint", word_wrap=True))
+        self.body.addWidget(card)
 
     def calibrate(self, cal_type: int):
         dev = self.dev
@@ -241,41 +258,48 @@ class BackupPage(Page):
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
-        self.backup_button = self.control(QPushButton("Back up both copies now"), lc.CAL_READ)
+        self.backup_button = self.control(set_kind(QPushButton("Back up both copies now"),
+                                                   "primary"), lc.CAL_READ)
         self.backup_button.clicked.connect(self.backup)
         self.files = QListWidget()
         self.files.setObjectName("backups")
+        self.files.setMaximumHeight(LIST_MAX_H)
+        self.files.setMinimumHeight(120)
         self.files.currentItemChanged.connect(lambda *_: self.refresh_controls())
         self.compare_button = self.control(QPushButton("Compare with the meter"), lc.CAL_READ)
         self.compare_button.clicked.connect(self.compare)
-        self.copy_combo = QComboBox()
-        self.copy_combo.addItems(["A", "B"])
-        self.restore_button = self.control(QPushButton("Restore this copy…"),
+        self.copy_combo = Segmented(["A", "B"])
+        self.restore_button = self.control(set_kind(QPushButton("Restore this copy…"), "danger"),
                                            lc.SETTINGS_WRITE_BLOCK, lc.CAL_READ)
         self.restore_button.clicked.connect(self.restore)
-        self.result = QLabel("")
-        self.result.setWordWrap(True)
-        b = QVBoxLayout()
-        b.addLayout(row(self.backup_button))
-        b.addWidget(QLabel("Backups of this meter (UID %s):" % device.info.uid_hex))
-        b.addWidget(self.files)
-        b.addLayout(row(self.compare_button, "Copy:", self.copy_combo, self.restore_button))
-        b.addWidget(self.result)
-        self.body.addWidget(group("Backup and restore (SL 9.4)", b), 1)
+        self.result = label("", "mono", word_wrap=True)
+        b = Card("Backup and restore")
+        b.add_right(self.backup_button)
+        b.add(label("Backups of this meter (UID %s), newest first (SL 9.4):"
+                    % device.info.uid_hex, "hint", word_wrap=True))
+        b.add(self.files)
+        b.add(row(self.compare_button, "Copy", self.copy_combo, self.restore_button))
+        b.add(self.result)
+        self.body.addWidget(b)
 
-        rec = QVBoxLayout()
+        rec = Card("Recovery commands")
+        rec.add(label("Each one reads both settings copies into a backup file first.", "hint"))
         self.recovery_buttons = {}
-        for code, method, title, text in RECOVERY:
-            btn = self.control(QPushButton(title + "…"), code, lc.CAL_READ)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+        for r, (code, method, title, text) in enumerate(RECOVERY):
+            btn = self.control(set_kind(QPushButton(title + "…"), "danger"), code, lc.CAL_READ)
             btn.clicked.connect(lambda _=False, m=method, t=title, x=text: self.recovery(m, t, x))
-            lab = QLabel(text)
-            lab.setWordWrap(True)
-            rec.addLayout(row(btn, lab, stretch=False))
+            grid.addWidget(btn, r, 0)
+            grid.addWidget(label(text, "hint", word_wrap=True), r, 1)
             self.recovery_buttons[code] = btn
-        self.flags = QLabel("—")
-        self.flags.setWordWrap(True)
-        rec.addLayout(row("Meter state:", self.flags))
-        self.body.addWidget(group("Recovery commands (each makes a backup first)", rec))
+        rec.add(grid)
+        state_row = StatRow("Meter state", line=False)
+        self.flags = state_row.value
+        rec.add(state_row)
+        self.body.addWidget(rec)
         self.list_backups()
 
     def extra_enabled(self, widget) -> bool:

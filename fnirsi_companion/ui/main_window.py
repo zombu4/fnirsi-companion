@@ -1,4 +1,20 @@
-"""The program's window: device bar, the pages of the active meter, status bar.
+"""The program's window: sidebar, header, the views of the active meter, status line.
+
+Frame (DESIGN_UI sections 2 and 6): a sidebar (logo tile, one item per view, Settings at the bottom;
+Ctrl+1..9 follow its order), a header (title, the chips of firmware, bootloader, port, link, live
+readings, recording, update drive and a failed connection; the meter choice when there is a choice
+to make; Connect / Disconnect), a stack of the views, and the status line (the last note, the
+Cancel job button, the DTR state and the link counters). A view shows one or more pages; the
+pages hold the commands and their logic (ui.base.Page), a view only places them:
+  Live         LivePage, with the model's measurement controls (LcrPage / MultimeterPage) and its
+               row of meter keys (LcKeysPage / C2KeysPage) attached while a meter is connected
+  Trend, Log   TrendPage, LogPage
+  Update       DrivePage, while an update drive is shown
+  LC1020E      Compare (ComparePage); Meter settings (LcSettingsPage, CalibrationPage, BackupPage)
+  2C53T        Oscilloscope (ScopePage); Generator; Files; Meter settings (C2SettingsPage)
+  Meter        MeterPage;  Screen  ScreenshotPage
+  Diagnostics  the model's diagnostics page, its Keys page and the EventsPage
+  Settings     PreferencesPage
 
 Detection and the switch of the active meter (DESIGN 5, 13.13, 13.19):
 - The watcher (link.discover.Watcher, own threads) reports the meters' serial ports and the update
@@ -41,10 +57,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
-                               QMainWindow, QMessageBox, QPushButton, QTabWidget, QVBoxLayout,
-                               QWidget)
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+                               QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from ..core import paths
 from ..devices import c2c53t as c2
@@ -53,21 +69,79 @@ from ..devices.base import DeviceError, IdentifyError, PortLost, identify
 from ..link import discover
 from ..link.port import SerialLink
 from . import confirm as confirm_mod
+from . import style
 from .base import describe_error
+from .c2c53t import panels as c2_panels
 from .c2c53t.files import FilesPage
 from .c2c53t.panels import GeneratorPage, MultimeterPage
 from .c2c53t.scope import ScopePage
 from .c2c53t.tools import C2DiagnosticsPage, C2KeysPage, C2SettingsPage
-from .common.data_pages import LivePage, LogPage, TrendPage
+from .common.data_pages import LiveModel, LivePage, LogPage, TrendPage
 from .common.meter import DrivePage, MeterPage
 from .common.misc import EventsPage, PreferencesPage, ScreenshotPage
 from .jobs import JobRefused, JobRunner
+from .lc1020e import lcr as lc_lcr
 from .lc1020e.lcr import ComparePage, LcrPage
 from .lc1020e.storage import BackupPage, CalibrationPage, LcSettingsPage
 from .lc1020e.tools import LcDiagnosticsPage, LcKeysPage
+from .widgets import Chip, ElidedLabel, Logo, NavButton, NavList, set_kind
 
 IDLE_LIMIT = 600.0              # seconds without user action before DTR is dropped (13.23)
 LC_STATE_PERIOD_MS = 1000       # STATE stream of the LC1020E, so the pages follow the meter's keys
+LIVE_TIMEOUT = 3.0              # seconds without a reading after which the Live chip goes off
+
+# sidebar items: key -> (name, icon); the order per model is MainWindow.view_order()
+VIEW_INFO = {
+    "live": ("Live", "live"), "trend": ("Trend", "trend"), "log": ("Log", "log"),
+    "update": ("Update", "drive"), "compare": ("Compare", "compare"),
+    "scope": ("Oscilloscope", "scope"), "generator": ("Generator", "generator"),
+    "files": ("Files", "files"), "msettings": ("Meter settings", "sliders"),
+    "meter": ("Meter", "meter"), "screen": ("Screen", "screen"),
+    "diagnostics": ("Diagnostics", "wrench"), "settings": ("Settings", "gear"),
+}
+MODEL_VIEWS = {"LC1020E": ["compare", "msettings", "meter", "screen"],
+               "2C53T": ["scope", "generator", "files", "msettings", "meter", "screen"]}
+LOGO_LINES = {"LC1020E": ("LC", "1020E"), "2C53T": ("2C", "53T")}
+FILL_VIEWS = ("trend", "scope", "screen")     # views whose page takes the window's height
+
+
+class View:
+    """One sidebar item: its button and a scroll area holding its pages in a column (16 px page
+    margin and gap); the pages scroll vertically when the window is smaller than they are."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.name, icon = VIEW_INFO[key]
+        self.button = NavButton(key, self.name, icon)
+        self.area = QScrollArea()
+        self.area.setObjectName("view_" + key)
+        self.area.setWidgetResizable(True)
+        self.area.setFrameShape(QFrame.NoFrame)
+        self.area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.content = QWidget()
+        self.content.setObjectName("viewcontent")
+        self.lay = QVBoxLayout(self.content)
+        self.lay.setContentsMargins(16, 16, 16, 16)
+        self.lay.setSpacing(16)
+        self.fill = key in FILL_VIEWS
+        if not self.fill:
+            self.lay.addStretch(1)
+        self.area.setWidget(self.content)
+        self.pages: list = []
+
+    def add(self, page, index: int | None = None) -> None:
+        """Puts a page into the column (before the trailing stretch; at `index` when given)."""
+        n = len(self.pages)
+        at = n if index is None else index
+        self.lay.insertWidget(at, page, 1 if self.fill else 0)
+        self.pages.insert(at, page)
+        page.show()
+
+    def remove(self, page) -> None:
+        if page in self.pages:
+            self.pages.remove(page)
+            self.lay.removeWidget(page)
+            page.setParent(None)
 
 
 def port_key(p) -> tuple:
@@ -93,6 +167,9 @@ class Conn:
     device: object
     pages: list = field(default_factory=list)
     meter_page: object = None
+    views: dict = field(default_factory=dict)      # view key -> its pages
+    diag: list = field(default_factory=list)       # pages of the Diagnostics view
+    live: object = None                            # the LiveModel of the Live page
 
 
 class _GuiCall(QObject):
@@ -177,42 +254,13 @@ class MainWindow(QMainWindow):
         self._last_action = time.monotonic()
         self._dtr_dropped = False
         self.drive_page: DrivePage | None = None
+        self.version = version
+        self._closed_by_user = None          # port key of the meter disconnected by hand
+        self._last_reading = None            # monotonic time of the last reading (Live chip)
 
         self.setWindowTitle("FNIRSI Companion" + (" %s" % version if version else ""))
-        central = QWidget()
-        lay = QVBoxLayout(central)
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("Device:"))
-        self.device_list = QComboBox()
-        self.device_list.setObjectName("device_list")
-        self.device_list.setMinimumWidth(420)
-        bar.addWidget(self.device_list, 1)
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.clicked.connect(self.connect_selected)
-        bar.addWidget(self.connect_button)
-        self.disconnect_button = QPushButton("Disconnect")
-        self.disconnect_button.clicked.connect(self.disconnect_active)
-        bar.addWidget(self.disconnect_button)
-        self.bar_status = QLabel("searching for meters")
-        self.bar_status.setObjectName("bar_status")
-        bar.addWidget(self.bar_status, 1)
-        lay.addLayout(bar)
-        self._current_page = None
-        self.tabs = QTabWidget()
-        self.tabs.currentChanged.connect(self._tab_changed)
-        lay.addWidget(self.tabs, 1)
-        self.setCentralWidget(central)
-        self.stats_label = QLabel("no link")
-        self.stats_label.setObjectName("link_stats")
-        self.dtr_label = QLabel("")
-        self.dtr_label.setObjectName("dtr")
-        self.cancel_button = QPushButton("Cancel job")
-        self.cancel_button.setObjectName("cancel_job")
-        self.cancel_button.setEnabled(False)
-        self.cancel_button.clicked.connect(self.cancel_job)
-        self.statusBar().addPermanentWidget(self.cancel_button)
-        self.statusBar().addPermanentWidget(self.dtr_label)
-        self.statusBar().addPermanentWidget(self.stats_label)
+        self.setMinimumSize(1000, 640)
+        self._build_frame()
 
         previous = eventlog.previous(200) if eventlog is not None else []
         self.events = EventsPage(self, previous)
@@ -221,9 +269,19 @@ class MainWindow(QMainWindow):
         self.log = LogPage(self)
         self.prefs = PreferencesPage(self)
         self.common = [self.live, self.trend, self.log, self.events, self.prefs]
-        for p in (self.live, self.trend, self.log, self.events, self.prefs):
-            self.tabs.addTab(p, p.title)
-        self._current_page = self.tabs.currentWidget()
+        self.log.recording_changed.connect(self._recording_changed)
+        self.views: dict[str, View] = {}
+        for key, pages in (("live", [self.live]), ("trend", [self.trend]), ("log", [self.log]),
+                           ("diagnostics", [self.events]), ("settings", [self.prefs])):
+            v = self._add_view(key)
+            for p in pages:
+                v.add(p)
+        self._current_view: View | None = None
+        self._rebuild_nav()
+        self.select_view("live")
+        for i in range(1, 10):
+            sc = QShortcut(QKeySequence("Ctrl+%d" % i), self)
+            sc.activated.connect(lambda i=i: self.select_index(i - 1))
 
         watcher.meters_changed.connect(self._on_meters)
         watcher.drives_changed.connect(self._on_drives)
@@ -244,8 +302,304 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        try:
+            QGuiApplication.styleHints().colorSchemeChanged.connect(self._scheme_changed)
+        except AttributeError:
+            pass                              # a Qt without colour schemes: no "system" follow
+        style.on_theme(self._refresh_title)
         self._refresh_bar()
         self.apply_theme()
+
+    # ------------------------------------------------------------------------------------------
+    # the frame: sidebar, header, view stack, status line (DESIGN_UI 2, 6.1, 6.11, 6.12)
+    # ------------------------------------------------------------------------------------------
+    def _build_frame(self) -> None:
+        central = QWidget()
+        central.setObjectName("central")
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        side = QWidget()
+        side.setObjectName("sidebar")
+        side.setAttribute(Qt.WA_StyledBackground, True)
+        side.setFixedWidth(76)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 12, 1, 10)
+        sl.setSpacing(10)
+        self.logo = Logo()
+        sl.addWidget(self.logo, 0, Qt.AlignHCenter)
+        self.nav = NavList()
+        nav_area = QScrollArea()
+        nav_area.setWidgetResizable(True)
+        nav_area.setFrameShape(QFrame.NoFrame)
+        nav_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        nav_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        nav_area.setWidget(self.nav)
+        sl.addWidget(nav_area, 1)
+        self.nav_bottom = NavList()
+        sl.addWidget(self.nav_bottom)
+        outer.addWidget(side)
+
+        main = QWidget()
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(0)
+        outer.addWidget(main, 1)
+
+        # header
+        self.header = QWidget()
+        self.header.setObjectName("header")
+        self.header.setAttribute(Qt.WA_StyledBackground, True)
+        self.header.setFixedHeight(64)
+        hl = QHBoxLayout(self.header)
+        hl.setContentsMargins(24, 0, 24, 0)
+        hl.setSpacing(8)
+        self.title_label = QLabel()
+        self.title_label.setObjectName("title")
+        hl.addWidget(self.title_label)
+        hl.addSpacing(10)
+        self.fw_chip = Chip("Firmware")
+        self.fw_chip.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)   # elides when narrow
+        self.boot_chip = Chip("Bootloader")
+        self.port_chip = Chip()
+        self.link_chip = Chip("Link", dot="ok")
+        self.live_chip = Chip("Live", dot="hol")
+        self.rec_chip = Chip("Rec", dot="bad")
+        self.drive_chip = Chip("Drive", dot="hol")
+        self.fail_chip = Chip("connection failed", dot="bad")
+        self.fail_chip.set_bad(True)
+        self.chips = [self.fw_chip, self.boot_chip, self.port_chip, self.link_chip, self.live_chip,
+                      self.rec_chip, self.drive_chip, self.fail_chip]
+        self._chip_wanted = {c: False for c in self.chips}
+        for c in self.chips:
+            hl.addWidget(c)
+            c.hide()
+        self.bar_status = QLabel("searching for meters")
+        self.bar_status.setObjectName("bar_status")
+        self.bar_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        hl.addWidget(self.bar_status, 1)
+        hl.addStretch(1)
+        self.device_list = QComboBox()
+        self.device_list.setObjectName("device_list")
+        self.device_list.setMinimumWidth(200)
+        self.device_list.setMaximumWidth(360)
+        self.device_list.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.device_list.currentIndexChanged.connect(lambda _i: self._show_connect_button())
+        hl.addWidget(self.device_list)
+        self.connect_button = set_kind(QPushButton("Connect"), "primary")
+        self.connect_button.clicked.connect(self.connect_selected)
+        hl.addWidget(self.connect_button)
+        self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.clicked.connect(self.disconnect_active)
+        hl.addWidget(self.disconnect_button)
+        ml.addWidget(self.header)
+
+        self.stack = QStackedWidget()
+        ml.addWidget(self.stack, 1)
+
+        # status line
+        status = QWidget()
+        status.setObjectName("statusline")
+        status.setAttribute(Qt.WA_StyledBackground, True)
+        status.setFixedHeight(28)
+        st = QHBoxLayout(status)
+        st.setContentsMargins(24, 0, 24, 0)
+        st.setSpacing(14)
+        self.status_message = ElidedLabel("")
+        self.status_message.setObjectName("status_message")
+        st.addWidget(self.status_message, 1)
+        self.cancel_button = set_kind(QPushButton("Cancel job"), "small")
+        self.cancel_button.setObjectName("cancel_job")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_job)
+        st.addWidget(self.cancel_button)
+        self.dtr_label = QLabel("")
+        self.dtr_label.setObjectName("dtr")
+        st.addWidget(self.dtr_label)
+        self.stats_label = QLabel("no link")
+        self.stats_label.setObjectName("link_stats")
+        st.addWidget(self.stats_label)
+        ml.addWidget(status)
+        self.setCentralWidget(central)
+        self.header.installEventFilter(self)
+
+    def _add_view(self, key: str) -> View:
+        v = View(key)
+        v.button.clicked.connect(lambda _=False, k=key: self.select_view(k))
+        self.views[key] = v
+        self.stack.addWidget(v.area)
+        return v
+
+    def _drop_view(self, key: str) -> None:
+        """Removes a view (its pages were taken out or are deleted by their owner)."""
+        v = self.views.pop(key, None)
+        if v is None:
+            return
+        if self._current_view is v:
+            self._current_view = None
+        self.stack.removeWidget(v.area)
+        v.button.setParent(None)
+        v.button.deleteLater()
+        v.area.deleteLater()
+
+    def view_order(self) -> list[str]:
+        """The sidebar's items in their fixed order for the active model (Ctrl+1..9 follow it)."""
+        keys = ["live", "trend", "log"]
+        if self.drive_page is not None and "update" in self.views:
+            keys.append("update")
+        if self.active is not None:
+            keys += [k for k in MODEL_VIEWS[self.active.device.model] if k in self.views]
+        keys += ["diagnostics", "settings"]
+        return keys
+
+    def nav_titles(self) -> list[str]:
+        return [self.views[k].name for k in self.view_order()]
+
+    def _rebuild_nav(self) -> None:
+        for lst in (self.nav, self.nav_bottom):
+            while lst.lay.count():
+                w = lst.lay.takeAt(0).widget()
+                if w is not None:
+                    w.setParent(None)
+        for k in self.view_order():
+            b = self.views[k].button
+            (self.nav_bottom if k == "settings" else self.nav).lay.addWidget(b)
+            b.show()
+        if self._current_view is None or self._current_view.key not in self.views:
+            self.select_view("live")
+        self.nav.update()
+        self.nav_bottom.update()
+
+    def select_view(self, key: str) -> None:
+        """Shows view `key`: its pages get on_shown, the pages of the view left on_hidden."""
+        new = self.views.get(key)
+        if new is None:
+            return
+        old = self._current_view
+        self._current_view = new
+        self.stack.setCurrentWidget(new.area)
+        for v in self.views.values():
+            v.button.setChecked(v is new)
+        self.nav.update()
+        self.nav_bottom.update()
+        if old is new:
+            return
+        if old is not None and old.key in self.views:
+            for p in old.pages:
+                p.on_hidden()
+        for p in new.pages:
+            p.on_shown()
+
+    def select_index(self, i: int) -> None:
+        order = self.view_order()
+        if 0 <= i < len(order):
+            self.select_view(order[i])
+
+    def current_view(self) -> str | None:
+        return self._current_view.key if self._current_view is not None else None
+
+    def show_page(self, page) -> None:
+        """Shows the view that holds `page`."""
+        for k, v in self.views.items():
+            if page in v.pages:
+                self.select_view(k)
+                return
+
+    def _refresh_title(self) -> None:
+        ink2 = style.qss(style.color("ink-2"))
+        if self.active is not None:
+            self.title_label.setText('<span style="font-weight:700">%s</span> <span style="'
+                                     'color:%s;font-weight:500">Companion</span>'
+                                     % (self.active.device.model, ink2))
+        else:
+            self.title_label.setText('<span style="font-weight:700">FNIRSI</span> <span style="'
+                                     'color:%s;font-weight:500">Companion</span>' % ink2)
+
+    def _want_chip(self, chip: Chip, on: bool) -> None:
+        self._chip_wanted[chip] = on
+
+    def _refresh_chips(self) -> None:
+        """The header's chips from the connection, the readings, the recording and the drives
+        (DESIGN_UI 2, 6.12); then the header is fitted to its width."""
+        conn = self.active
+        if conn is not None:
+            d, info = conn.device, conn.device.info
+            fw = info.firmware
+            if fw.startswith(d.model):
+                fw = fw[len(d.model):].strip()
+            self.fw_chip.set_text("Firmware", fw)
+            self._want_chip(self.fw_chip, True)
+            mod = lc if d.model == "LC1020E" else c2
+            slot = mod.SLOT_NAME.get(info.running_slot)
+            known = slot is not None and info.running_slot != 0xFF and info.slot_version >= 1
+            if known:
+                self.boot_chip.set_text("Bootloader", "%s·v%d" % (slot, info.slot_version))
+            self._want_chip(self.boot_chip, known)
+            self.port_chip.set_text("", conn.port.device)
+            self.port_chip.setToolTip("USB serial number %s" % (conn.port.serial or "none"))
+            self._want_chip(self.port_chip, True)
+        else:
+            for c in (self.fw_chip, self.boot_chip, self.port_chip):
+                self._want_chip(c, False)
+        self.link_chip.set_on(conn is not None and conn.device.link.is_open)
+        self._want_chip(self.link_chip, True)
+        live = self._last_reading is not None and conn is not None \
+            and time.monotonic() - self._last_reading < LIVE_TIMEOUT
+        self.live_chip.set_on(live)
+        self._want_chip(self.live_chip, True)
+        self.rec_chip.set_on(self.log.recorder.recording if hasattr(self, "log") else False)
+        self._want_chip(self.rec_chip, True)
+        self.drive_chip.set_on(bool(self.drives))
+        self._want_chip(self.drive_chip, True)
+        fails = {k: v for k, v in self.failed.items() if k != self._closed_by_user}
+        if fails:
+            self.fail_chip.setToolTip("\n".join(fails.values()))
+        self._want_chip(self.fail_chip, bool(fails))
+        self.device_list.setVisible(self.device_list.count() > 1 or bool(fails))
+        self._show_connect_button()
+        self._fit_header()
+
+    def _show_connect_button(self) -> None:
+        """One button: Disconnect for the active meter, Connect for any other choice."""
+        cur = self.device_list.currentData()
+        active_chosen = self.active is not None and (
+            self.device_list.isHidden() or cur is None
+            or (cur[0] == "meter" and port_key(cur[1]) == port_key(self.active.port)))
+        self.disconnect_button.setVisible(active_chosen)
+        self.connect_button.setVisible(not active_chosen)
+
+    def _fit_header(self) -> None:
+        """Hides the chips that do not fit: Drive and Rec first, then the bootloader chip; the
+        firmware chip elides its text (DESIGN_UI 6.12)."""
+        hl = self.header.layout()
+        m = hl.contentsMargins()
+        avail = self.header.width() - m.left() - m.right() - self.title_label.sizeHint().width() \
+            - 18
+        for w in (self.device_list, self.connect_button, self.disconnect_button):
+            if not w.isHidden():
+                avail -= w.sizeHint().width() + hl.spacing()
+        shown = [c for c in self.chips if self._chip_wanted[c]]
+        for c in (self.drive_chip, self.rec_chip, self.boot_chip):
+            if sum(x.sizeHint().width() + hl.spacing() for x in shown) <= avail:
+                break
+            if c in shown:
+                shown.remove(c)
+        over = sum(x.sizeHint().width() + hl.spacing() for x in shown) - avail
+        hint = self.fw_chip.sizeHint().width()
+        self.fw_chip.setMaximumWidth(max(110, hint - over) if over > 0 else hint)
+        for c in self.chips:
+            c.setVisible(c in shown)
+        self.bar_status.setVisible(self.active is None)
+
+    @Slot(bool)
+    def _recording_changed(self, _on: bool) -> None:
+        self.live.show_recording()
+        self._refresh_chips()
+
+    def _scheme_changed(self, *_a) -> None:
+        if self.settings.get("theme") == "system":
+            style.apply(QApplication.instance(), "system")
 
     # ------------------------------------------------------------------------------------------
     # context offered to the pages
@@ -268,7 +622,7 @@ class MainWindow(QMainWindow):
         self.events.add(text)
         if self.eventlog is not None:
             self.eventlog.write(time.time(), text)
-        self.statusBar().showMessage(text, 8000)
+        self.status_message.setText(text)
 
     def publish_state(self, st) -> None:
         self._on_state(st)
@@ -312,6 +666,7 @@ class MainWindow(QMainWindow):
             hints.setColorScheme(scheme)
         except AttributeError:
             self.note("theme: this Qt cannot set the colour scheme")
+        style.apply(QApplication.instance(), self.settings.get("theme"))
 
     # ------------------------------------------------------------------------------------------
     # watcher
@@ -434,6 +789,10 @@ class MainWindow(QMainWindow):
         busy = self.jobs.busy
         self.connect_button.setEnabled(not busy)
         self.disconnect_button.setEnabled(not busy and self.active is not None)
+        self.logo.set_lines(*LOGO_LINES.get(self.active.device.model if self.active else "",
+                                            ("FN", "—")))
+        self._refresh_title()
+        self._refresh_chips()
 
     def _sync_drive_page(self) -> None:
         if self.jobs.busy:
@@ -484,15 +843,20 @@ class MainWindow(QMainWindow):
         owner, why = self.c2_drive_owner() if drive.model == "2C53T" else (None, "")
         self.drive_page = DrivePage(self, drive, owner, why)
         self.drive_page.set_busy(self.jobs.busy)
-        self.tabs.insertTab(3, self.drive_page, self.drive_page.title)
-        self.tabs.setCurrentWidget(self.drive_page)
+        self._add_view("update").add(self.drive_page)
+        self._rebuild_nav()
+        self.select_view("update")
 
     def _remove_drive_page(self) -> None:
         dp, self.drive_page = self.drive_page, None
         if dp is not None:
             dp.retire()
-            self.tabs.removeTab(self.tabs.indexOf(dp))
+            v = self.views.get("update")
+            if v is not None:
+                v.remove(dp)
             dp.deleteLater()
+            self._drop_view("update")
+            self._rebuild_nav()
 
     # ------------------------------------------------------------------------------------------
     # connect / disconnect
@@ -516,6 +880,7 @@ class MainWindow(QMainWindow):
         self.wanted = None
         conn = self.active
         self.failed[port_key(conn.port)] = "disconnected by you (Connect opens it again)"
+        self._closed_by_user = port_key(conn.port)    # not shown as a failed connection
         self._teardown(conn)
         self.note("disconnected %s" % conn.device.model)
 
@@ -591,8 +956,7 @@ class MainWindow(QMainWindow):
         dev.state.connect(self._on_state)
         dev.meter_event.connect(self._on_meter_event)
         conn.pages = self._build_pages(conn)
-        for i, p in enumerate(conn.pages):
-            self.tabs.insertTab(3 + i, p, p.title)
+        self._show_pages(conn)
         self.note("connected %s %s, UID %s, on %s (serial %s)" % (
             dev.model, info.firmware, info.uid_hex, port.device, port.serial or "none"))
         self._refresh_bar()
@@ -618,16 +982,38 @@ class MainWindow(QMainWindow):
         meter = MeterPage(ctx, dev, conn.port)
         conn.meter_page = meter
         if dev.model == "LC1020E":
-            pages = [LcrPage(ctx, dev), ComparePage(ctx, dev), LcSettingsPage(ctx, dev),
-                     CalibrationPage(ctx, dev), BackupPage(ctx, dev), LcKeysPage(ctx, dev), meter,
-                     ScreenshotPage(ctx, dev, lc.SCREENSHOT), LcDiagnosticsPage(ctx, dev)]
+            lcr, cmp, sett = LcrPage(ctx, dev), ComparePage(ctx, dev), LcSettingsPage(ctx, dev)
+            cal, bak, keys = CalibrationPage(ctx, dev), BackupPage(ctx, dev), LcKeysPage(ctx, dev)
+            shot, diag = ScreenshotPage(ctx, dev, lc.SCREENSHOT), LcDiagnosticsPage(ctx, dev)
+            pages = [lcr, cmp, sett, cal, bak, keys, meter, shot, diag]
+            conn.views = {"compare": [cmp], "msettings": [sett, cal, bak], "meter": [meter],
+                          "screen": [shot]}
+            conn.live = LiveModel(lc_lcr.LCD_WORDS, lcr.lcd_flags, True, lcr, keys.live_keys)
         else:
-            pages = [MultimeterPage(ctx, dev), ScopePage(ctx, dev), GeneratorPage(ctx, dev),
-                     FilesPage(ctx, dev), C2SettingsPage(ctx, dev), C2KeysPage(ctx, dev), meter,
-                     ScreenshotPage(ctx, dev, c2.SCREENSHOT), C2DiagnosticsPage(ctx, dev)]
+            mm, scope, gen = MultimeterPage(ctx, dev), ScopePage(ctx, dev), GeneratorPage(ctx, dev)
+            files, sett, keys = FilesPage(ctx, dev), C2SettingsPage(ctx, dev), C2KeysPage(ctx, dev)
+            shot, diag = ScreenshotPage(ctx, dev, c2.SCREENSHOT), C2DiagnosticsPage(ctx, dev)
+            pages = [mm, scope, gen, files, sett, keys, meter, shot, diag]
+            conn.views = {"scope": [scope], "generator": [gen], "files": [files],
+                          "msettings": [sett], "meter": [meter], "screen": [shot]}
+            conn.live = LiveModel(c2_panels.LCD_WORDS, mm.lcd_flags, False, mm, keys.live_keys)
+        conn.diag = [diag, keys]
         for p in pages:
             p.set_busy(self.jobs.busy)
         return pages
+
+    def _show_pages(self, conn: Conn) -> None:
+        """Puts a connected meter's pages into their views, the Diagnostics view and the Live
+        page, and shows its sidebar items."""
+        for key, pages in conn.views.items():
+            v = self._add_view(key)
+            for p in pages:
+                v.add(p)
+        diag = self.views["diagnostics"]
+        for i, p in enumerate(conn.diag):
+            diag.add(p, i)
+        self.live.attach(conn.live)
+        self._rebuild_nav()
 
     def _start(self, conn: Conn, first: bool) -> None:
         """Live stream (and the LC1020E's STATE stream), the 2C53T's first STATE and, at its first
@@ -688,16 +1074,28 @@ class MainWindow(QMainWindow):
                 sig.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
+        self.live.meter_gone()                  # takes the model's block off the Live page
+        current = self.current_view()
         for p in conn.pages:
             p.retire()
-            self.tabs.removeTab(self.tabs.indexOf(p))
+            for v in self.views.values():
+                v.remove(p)
+            p.setParent(None)
+            for w in p.extras:
+                w.setParent(None)
+                w.deleteLater()
             p.deleteLater()
+        for key in conn.views:
+            self._drop_view(key)
         conn.pages = []
         if self.active is conn:
             self.active = None
         self._last_state = None
+        self._last_reading = None
         self._dtr_dropped = False
-        self.live.meter_gone()
+        self._rebuild_nav()
+        if current not in self.views:
+            self.select_view("live")
 
         def job(_p):
             if link.is_open:
@@ -854,6 +1252,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------------------------------
     @Slot(object)
     def _on_reading(self, r) -> None:
+        first = self._last_reading is None or \
+            time.monotonic() - self._last_reading >= LIVE_TIMEOUT
+        self._last_reading = time.monotonic()
+        if first:
+            self._refresh_chips()            # the Live chip lights at once
         verdict = self.live.add(r)
         self.trend.add(r)
         self.log.add(r, verdict)
@@ -866,6 +1269,7 @@ class MainWindow(QMainWindow):
         self._last_state = st
         for p in conn.pages:
             p.on_state(st)
+        self.live.on_state(st)                # the LCD's annunciators follow the record
 
     @Slot(object)
     def _on_meter_event(self, ev) -> None:
@@ -878,20 +1282,12 @@ class MainWindow(QMainWindow):
             for p in conn.pages:
                 p.on_event(ev)
 
-    def _tab_changed(self, index: int) -> None:
-        old = self._current_page
-        new = self.tabs.widget(index)
-        self._current_page = new
-        if old is not None and old is not new and hasattr(old, "on_hidden"):
-            old.on_hidden()
-        if new is not None and hasattr(new, "on_shown"):
-            new.on_shown()
-
     # ------------------------------------------------------------------------------------------
-    # status bar, DTR, releases
+    # status line, DTR, releases
     # ------------------------------------------------------------------------------------------
     def _show_stats(self) -> None:
         conn = self.active
+        self._refresh_chips()                 # the Live chip goes off 3 s after the last reading
         if conn is None:
             self.stats_label.setText("no link")
             self.dtr_label.setText("")
@@ -913,6 +1309,8 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, ev) -> bool:
         if ev.type() in (QEvent.MouseButtonPress, QEvent.KeyPress, QEvent.Wheel):
             self.user_action()
+        elif ev.type() == QEvent.Resize and obj is self.header:
+            self._fit_header()
         return False
 
     def user_action(self) -> None:

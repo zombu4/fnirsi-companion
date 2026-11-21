@@ -18,9 +18,11 @@ The context (the main window) offers:
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QPlainTextEdit, QSizePolicy,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPlainTextEdit, QSizePolicy, QVBoxLayout,
+                               QWidget)
 
+from . import style
+from .widgets import Card, Segmented
 from ..devices.base import (AnswerTimeout, Cancelled, CapabilityError, IdentifyError, PortLost,
                             SafetyRefused, StatusError)
 
@@ -68,26 +70,30 @@ def hexdump(data: bytes, base: int = 0) -> str:
 
 
 def mono_text() -> QPlainTextEdit:
+    """A read-only text box in the mono font (the outputs of the diagnostics)."""
     t = QPlainTextEdit()
     t.setReadOnly(True)
-    f = t.font()
-    f.setFamily("Menlo")
-    f.setStyleHint(f.StyleHint.Monospace)
-    t.setFont(f)
+    t.setFont(style.mono(12))
     return t
 
 
-def group(title: str, layout) -> QGroupBox:
-    g = QGroupBox(title)
-    g.setLayout(layout)
-    return g
+def group(title: str, layout) -> Card:
+    """A card with the title and the layout as its body (DESIGN_UI 3: cards replace every group
+    box)."""
+    c = Card(title)
+    c.add(layout)
+    return c
 
 
 def row(*widgets, stretch: bool = True) -> QHBoxLayout:
+    """A row of widgets; a string becomes a label in ink-2."""
     h = QHBoxLayout()
+    h.setSpacing(8)
     for w in widgets:
         if isinstance(w, str):
-            h.addWidget(QLabel(w))
+            lab = QLabel(w)
+            lab.setProperty("role", "label")
+            h.addWidget(lab)
         else:
             h.addWidget(w)
     if stretch:
@@ -111,14 +117,20 @@ class Page(QWidget):
         self._busy = False
         self.retired = False
         self._dirty: dict[str, bool] = {}
+        self.extras: list[QWidget] = []     # widgets of the page placed on another view
         self.outer = QVBoxLayout(self)
+        self.outer.setContentsMargins(0, 0, 0, 0)
+        self.outer.setSpacing(8)
         self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 0, 0, 0)
+        self.body.setSpacing(16)
         self.outer.addLayout(self.body, 1)
         self.status = QLabel("")
         self.status.setObjectName("page_status")
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.status.hide()                  # shown once the page has something to say
         self.outer.addWidget(self.status)
 
     # -- controls -----------------------------------------------------------------------------
@@ -170,7 +182,7 @@ class Page(QWidget):
         for w in widgets:
             if isinstance(w, QCheckBox):
                 sig = w.toggled
-            elif isinstance(w, QComboBox):
+            elif isinstance(w, (QComboBox, Segmented)):
                 sig = w.currentIndexChanged
             elif isinstance(w, QAbstractSpinBox):
                 sig = w.valueChanged
@@ -224,7 +236,9 @@ class Page(QWidget):
 
     def say(self, text: str, error: bool = False, log: bool = True) -> None:
         self.status.setText(text)
-        self.status.setStyleSheet("color: #c0392b;" if error else "")
+        self.status.setVisible(bool(text))
+        self.status.setProperty("error", bool(error))     # the sheet colours an error in bad
+        style.repolish(self.status)
         if log:
             self.ctx.note("%s: %s" % (self.title, text))
 

@@ -17,17 +17,19 @@ import time
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGridLayout, QLabel,
-                               QPushButton, QSpinBox)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QPushButton,
+                               QSpinBox, QWidget)
 
 from ...devices import c2c53t as c2
-from ..base import Page, group, row
+from .. import style
+from ..base import Page, row
+from ..widgets import Card, FlowLayout, Segmented, StatRow, label, set_kind
 
 POLL_MS = 100
 # STATE pages the trace is asked for on: 2 scope and 9 scope menu (S2 4.6). S2 4.4 requires the
 # scope page; whether the scope menu counts is not stated, a status 3 there pauses the polling.
 SCOPE_PAGES = (2, 9)
-CHANNEL_PENS = ("#f1c40f", "#3498db")
+CHANNEL_TOKENS = ("trace", "cursor-a")       # CH1, CH2 colours (DESIGN_UI 6.9)
 
 
 class ScopePage(Page):
@@ -44,23 +46,12 @@ class ScopePage(Page):
         self.polls = 0
         self.pause_until = 0.0
 
-        self.plot = pg.PlotWidget()
-        self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.plot.setLabel("bottom", "sample")
-        self.plot.setLabel("left", "display rows from the centre line")
-        self.plot.setXRange(0, c2.WAVE_SAMPLES - 1)
-        self.plot.setYRange(-128, 127)
-        self.curves = [self.plot.plot([], [], pen=pg.mkPen(CHANNEL_PENS[i], width=2))
-                       for i in range(2)]
-        self.body.addWidget(self.plot, 1)
-        self.age = QLabel("no trace yet")
-        self.age.setObjectName("trace_age")
-        self.body.addWidget(self.age)
-
+        # the trace card: commands, plot, age of the newest trace
+        tc = Card()
         self.page_button = self.control(QPushButton("Open the scope page (PAGE 2)"), c2.PAGE)
         self.page_button.clicked.connect(
             lambda: self.run("PAGE 2", lambda p: self.dev.page(2), self.ctx.publish_state))
-        self.run_button = self.control(QPushButton("Run"), c2.SCOPE_RUN)
+        self.run_button = self.control(set_kind(QPushButton("Run"), "primary"), c2.SCOPE_RUN)
         self.run_button.clicked.connect(lambda: self._send("SCOPE_RUN", lambda: self.dev.scope_run(True)))
         self.stop_button = self.control(QPushButton("Stop"), c2.SCOPE_RUN)
         self.stop_button.clicked.connect(lambda: self._send("SCOPE_RUN", lambda: self.dev.scope_run(False)))
@@ -69,31 +60,58 @@ class ScopePage(Page):
         self.autocorrect = self.control(QPushButton("Auto-correction"), c2.SCOPE_AUTOCORRECT)
         self.autocorrect.clicked.connect(lambda: self._send("SCOPE_AUTOCORRECT",
                                                             self.dev.scope_autocorrect))
-        self.running = QLabel("—")
-        self.body.addLayout(row(self.page_button, self.run_button, self.stop_button, self.autoset,
-                                self.autocorrect, self.running))
+        self.running = label("—", "mono")
+        bar_w = QWidget()
+        bar = FlowLayout(bar_w, spacing=8)
+        for b in (self.run_button, self.stop_button, self.autoset, self.autocorrect,
+                  self.page_button):
+            bar.addWidget(b)
+        tc.add(bar_w)
+        tc.add(self.running)
+        self.plot = pg.PlotWidget()
+        self.plot.setMinimumHeight(300)
+        style.theme_plot(self.plot)
+        self.plot.setLabel("bottom", "sample")
+        self.plot.setLabel("left", "display rows from the centre line")
+        self.plot.setXRange(0, c2.WAVE_SAMPLES - 1)
+        self.plot.setYRange(-128, 127)
+        self.curves = [self.plot.plot([], []) for _ in range(2)]
+        tc.add(self.plot, 1)
+        self.age = label("no trace yet", "mono", word_wrap=True)
+        self.age.setObjectName("trace_age")
+        tc.add(self.age)
+        self.body.addWidget(tc, 1)
+        self._pens()
+        style.on_theme(self._pens)
 
+        # timebase and channels
         self.timebase = self.control(QComboBox(), c2.SCOPE_TIMEBASE)
         self.timebase.setObjectName("timebase")
+        self.timebase.setMinimumWidth(140)
         self.timebase.activated.connect(self._timebase)
+        chc = Card("Timebase and channels")
+        chc.add(row("Timebase", self.timebase))
         grid = QGridLayout()
-        grid.addWidget(QLabel("Timebase"), 0, 0)
-        grid.addWidget(self.timebase, 0, 1)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        for col, text in enumerate(("", "V/div", "Offset (-100..100)", "Coupling", "Probe", "",
+                                    "")):
+            if text:
+                grid.addWidget(label(text, "caption"), 0, col)
         self.ch = []
         for n in range(2):
             w = {
                 "enabled": QCheckBox("CH%d on" % (n + 1)),
                 "vdiv": QComboBox(),
                 "offset": QSpinBox(),
-                "coupling": QComboBox(),
-                "probe": QComboBox(),
+                "coupling": Segmented(["AC", "DC"]),
+                "probe": Segmented(["x1", "x10"]),
                 "fft": QCheckBox("FFT"),
                 "apply": self.control(QPushButton("Apply CH%d" % (n + 1)), c2.SCOPE_CHANNEL),
             }
             w["vdiv"].setObjectName("vdiv_%d" % n)
+            w["vdiv"].setMinimumWidth(110)
             w["offset"].setRange(-100, 100)
-            w["coupling"].addItems(["AC", "DC"])
-            w["probe"].addItems(["x1", "x10"])
             w["probe"].currentIndexChanged.connect(lambda _i, n=n: self._fill_vdiv(n))
             w["apply"].clicked.connect(lambda _=False, n=n: self.apply_channel(n))
             r = n + 1
@@ -101,33 +119,42 @@ class ScopePage(Page):
                                        "apply")):
                 grid.addWidget(w[key], r, col)
             self.ch.append(w)
-        self.body.addWidget(group("Timebase and channels (V/div, offset -100..100, coupling, "
-                                  "probe, FFT)", grid))
+        grid.setColumnStretch(7, 1)
+        chc.add(grid)
 
-        self.t_source = QComboBox()
-        self.t_source.addItems(["CH1", "CH2"])
-        self.t_edge = QComboBox()
-        self.t_edge.addItems(["edge 0", "edge 1"])
+        # trigger
+        self.t_source = Segmented(["CH1", "CH2"])
+        self.t_edge = Segmented(["edge 0", "edge 1"])
         self.t_level = QSpinBox()
         self.t_level.setRange(-100, 100)
-        self.t_mode = QComboBox()
+        self.t_mode = Segmented()
         for k, name in c2.TRIGGER_MODE.items():
             self.t_mode.addItem(name, k)
         self.t_apply = self.control(QPushButton("Apply trigger"), c2.SCOPE_TRIGGER)
         self.t_apply.clicked.connect(self.apply_trigger)
-        tf = QFormLayout()
-        tf.addRow("Source", self.t_source)
-        tf.addRow("Edge", self.t_edge)
-        tf.addRow("Level (-100..100)", self.t_level)
-        tf.addRow("Mode", self.t_mode)
-        tf.addRow(self.t_apply)
-        tf.addRow(QLabel("A source change needs both channels on (S2 4.4); a single shot is "
-                         "mode single + Run."))
-        self.body.addWidget(group("Trigger", tf))
-        self.meter_values = QLabel("—")
+        trc = Card("Trigger")
+        tg = QGridLayout()
+        tg.setHorizontalSpacing(12)
+        tg.setVerticalSpacing(10)
+        tg.setColumnStretch(2, 1)
+        for r, (name, w) in enumerate((("Source", self.t_source), ("Edge", self.t_edge),
+                                       ("Level (-100..100)", self.t_level),
+                                       ("Mode", self.t_mode))):
+            tg.addWidget(label(name), r, 0)
+            tg.addWidget(w, r, 1)
+        trc.add(tg)
+        trc.add(row(self.t_apply))
+        trc.add(label("A source change needs both channels on (S2 4.4); a single shot is mode "
+                      "single + Run.", "hint", word_wrap=True))
+        lower = QHBoxLayout()
+        lower.setSpacing(16)
+        lower.addWidget(chc, 3)
+        lower.addWidget(trc, 2)
+        self.body.addLayout(lower)
+        mv = StatRow("Meter", line=False)
+        self.meter_values = mv.value
         self.meter_values.setObjectName("scope_meter_values")
-        self.meter_values.setWordWrap(True)
-        self.body.addLayout(row("Meter:", self.meter_values))
+        chc.add(mv)
         for n in range(2):
             w = self.ch[n]
             self.edits("ch%d" % n, w["enabled"], w["vdiv"], w["offset"], w["coupling"],
@@ -139,6 +166,11 @@ class ScopePage(Page):
         self.timer.timeout.connect(self.poll)
         if device.has(c2.SCOPE_TABLES):
             self.run("SCOPE_TABLES", lambda p: device.scope_tables(), self._tables)
+
+    def _pens(self) -> None:
+        """CH1 in the trace colour, CH2 in the cursor A colour of the theme."""
+        for curve, tok in zip(self.curves, CHANNEL_TOKENS):
+            curve.setPen(pg.mkPen(style.color(tok), width=1.5))
 
     # -- tables -------------------------------------------------------------------------------
     def _tables(self, t: c2.ScopeTables) -> None:

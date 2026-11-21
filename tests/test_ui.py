@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtCore import QObject, Qt, Signal                       # noqa: E402
 from PySide6.QtTest import QSignalSpy, QTest                     # noqa: E402
-from PySide6.QtWidgets import QApplication                       # noqa: E402
+from PySide6.QtWidgets import QApplication, QPushButton          # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
 
@@ -34,6 +34,7 @@ from fnirsi_companion.devices import lc1020e as lc               # noqa: E402
 from fnirsi_companion.devices import base as base_mod            # noqa: E402
 from fnirsi_companion.link.discover import DriveInfo, PortInfo, Volume   # noqa: E402
 from fnirsi_companion.ui import confirm as confirm_mod           # noqa: E402
+from fnirsi_companion.ui import style, widgets                   # noqa: E402
 from fnirsi_companion.ui.main_window import MainWindow           # noqa: E402
 
 LC_SERIAL = fl.INVENTED_UID.hex().upper()
@@ -161,19 +162,27 @@ class Bench(unittest.TestCase):
 # ----------------------------------------------------------------------------------------------
 class DetectAndSwitch(Bench):
     def test_auto_detect_and_switch_to_a_new_meter(self):
+        self.assertEqual(self.win.nav_titles(), ["Live", "Trend", "Log", "Diagnostics",
+                                                 "Settings"])            # no meter yet
         self.plug(LC_PORT)
         self.assertTrue(self.connected("LC1020E"))
-        titles = [self.win.tabs.tabText(i) for i in range(self.win.tabs.count())]
-        self.assertEqual(titles, ["Live", "Trend", "Log", "LCR", "Compare", "Settings",
-                                  "Calibration", "Backup", "Keys", "Meter", "Screenshot",
-                                  "Diagnostics", "Events", "Preferences"])
+        self.assertEqual(self.win.nav_titles(), ["Live", "Trend", "Log", "Compare",
+                                                 "Meter settings", "Meter", "Screen",
+                                                 "Diagnostics", "Settings"])
+        self.assertEqual([p.title for p in self.win.active.pages],
+                         ["LCR", "Compare", "Settings", "Calibration", "Backup", "Keys", "Meter",
+                          "Screenshot", "Diagnostics"])
         self.assertIn(lc.MEASURE_STREAM, self.lc_meter.cmds())
         self.assertEqual(self.lc_meter.measure_stream, 0)
         self.plug(LC_PORT, C2_PORT)
         self.assertTrue(self.connected("2C53T"))
-        titles = [self.win.tabs.tabText(i) for i in range(self.win.tabs.count())]
-        self.assertEqual(titles[3:12], ["Multimeter", "Oscilloscope", "Generator", "Files",
-                                        "Settings", "Keys", "Meter", "Screenshot", "Diagnostics"])
+        self.assertEqual(self.win.nav_titles(), ["Live", "Trend", "Log", "Oscilloscope",
+                                                 "Generator", "Files", "Meter settings", "Meter",
+                                                 "Screen", "Diagnostics", "Settings"])
+        self.assertEqual([p.title for p in self.win.active.pages],
+                         ["Multimeter", "Oscilloscope", "Generator", "Files", "Settings", "Keys",
+                          "Meter", "Screenshot", "Diagnostics"])
+        self.assertNotIn("compare", self.win.views)                # the LC1020E's views went
         self.assertEqual(self.lc_meter.measure_stream, 0xFFFF)       # stopped when switched away
         # 13.1: the 2C53T's calibration page backed up at its first identification
         folder = os.path.join(self.tmp.name, "backups", "2C53T-" + f2.INVENTED_UID.hex().upper())
@@ -384,7 +393,8 @@ class Lc1020ePages(Bench):
         self.win.trend.export()
         self.assertIn("exported 3 points", self.win.trend.status.text())
         self.win.trend.cursors.setChecked(True)
-        self.assertIn("C1", self.win.trend.cursor_info.text())
+        self.assertIn("A t", self.win.trend.cursor_info.text())
+        self.assertIn(" s · 100 nF", self.win.trend.cursor_info.text())
 
     def test_lcr_selectors_from_the_meter_tables(self):
         p = self.page("LCR")
@@ -481,7 +491,8 @@ class Lc1020ePages(Bench):
         self.done(mp.reset())
         self.assertEqual(self.lc_meter.restarts, 1)
         self.done(mp.check_releases(False))
-        self.assertEqual(mp.release_combo.currentText(), "no releases published")
+        self.assertEqual(mp.release_table.rowCount(), 0)
+        self.assertEqual(mp.no_releases.text(), "no releases published")
         shot = self.page("Screenshot")
         self.done(shot.capture(), 20)
         self.assertEqual((shot.image.width(), shot.image.height()), (320, 240))
@@ -508,7 +519,7 @@ class Lc1020ePages(Bench):
         pp = self.win.prefs
         pp.csv.setCurrentIndex(1)
         self.assertEqual(settings_mod.Settings(self.settings.path).get("csv_separator"), ";")
-        pp.theme.setCurrentIndex(2)
+        pp.theme.setCurrentIndex(pp.theme.findData("dark"))
         self.assertEqual(self.settings.get("theme"), "dark")
 
 
@@ -547,7 +558,8 @@ class C2c53tPages(Bench):
         self.assertTrue(wait(lambda: sp.timebase.count() == 29))
         self.c2_meter.state_kw["page"] = 2
         self.done(self.page("Diagnostics").state())
-        self.win.tabs.setCurrentWidget(sp)
+        self.win.show_page(sp)
+        self.assertEqual(self.win.current_view(), "scope")
         self.assertTrue(wait(lambda: sp.waves.get(0) is not None))
         self.assertIn(c2.SCOPE_WAVE, self.c2_meter.cmds())
         self.assertIn("trace age", sp.age.text())
@@ -564,7 +576,8 @@ class C2c53tPages(Bench):
         self.settle()
         for code in (c2.SCOPE_RUN, c2.SCOPE_AUTOSET, c2.SCOPE_AUTOCORRECT):
             self.assertIn(code, self.c2_meter.cmds())
-        self.win.tabs.setCurrentIndex(0)
+        self.win.select_index(0)
+        self.assertFalse(sp.timer.isActive())                     # polling stops when hidden
         self.settle()
 
     def test_files(self):
@@ -661,8 +674,11 @@ class C2c53tPages(Bench):
         mp = self.page("Meter")
         self.win.release_get = test_releases.FakeGitHub()
         self.done(mp.check_releases(False))
-        self.assertEqual(mp.release_combo.itemText(0)[:7], "v1.4.17")
-        self.assertIn("same", mp.release_combo.itemText(0))
+        tag, rel = mp.release_rows[0][0].tag, mp.release_rows[0][1]
+        self.assertEqual((tag, rel), ("v1.4.17", "same"))
+        self.assertEqual(mp.release_table.item(0, 0).text(), "v1.4.17")
+        self.assertTrue(mp.release_table.cellWidget(0, 3).findChild(
+            QPushButton, "install_v1.4.17").isEnabled())
         self.assertIn("none is newer than 1.4.17", mp.release_note.text())
 
     def test_application_update_with_the_foreign_image_warning(self):
@@ -750,6 +766,166 @@ class UpdateDrive(Bench):
         self.assertEqual(os.listdir(drive), [])
         self.watcher.drives_changed.emit([])
         self.assertTrue(wait(lambda: self.win.drive_page is None))
+
+
+# ----------------------------------------------------------------------------------------------
+class Look(Bench):
+    """DESIGN_UI 6.16: every sidebar view of each model in both themes at 1100 x 720, the theme
+    switch, the seven-segment characters, and the LCD's annunciators from the meter's records."""
+
+    def show_every_view(self):
+        shown = []
+        for theme in ("dark", "light"):
+            self.settings.set("theme", theme)
+            self.win.apply_theme()
+            self.assertEqual(style.name(), theme)
+            self.win.resize(1100, 720)
+            self.win.show()
+            for key in self.win.view_order():
+                self.win.select_view(key)
+                QApplication.processEvents()
+                self.assertEqual(self.win.current_view(), key)
+                img = self.win.grab()
+                self.assertFalse(img.isNull())
+                self.assertEqual((img.width(), img.height()), (1100, 720))
+                shown.append(key)
+        self.win.hide()
+        return shown
+
+    def test_every_view_without_a_meter(self):
+        self.assertEqual(self.show_every_view(),
+                         ["live", "trend", "log", "diagnostics", "settings"] * 2)
+
+    def test_every_view_of_the_lc1020e(self):
+        self.plug(LC_PORT)
+        self.lc_meter.pending.append((lc.MEASURE, fl.build_measure()))
+        self.done(self.page("Diagnostics").ping())
+        self.assertEqual(len(self.show_every_view()), 18)
+
+    def test_every_view_of_the_2c53t(self):
+        self.plug(C2_PORT)
+        self.assertEqual(len(self.show_every_view()), 22)
+
+    def test_update_drive_view(self):
+        drive = os.path.join(self.tmp.name, "LC1020E-IAP")
+        os.makedirs(drive)
+        self.watcher.drives_changed.emit([DriveInfo("LC1020E", drive, 0x19F5, 0x5740, "ready")])
+        self.assertTrue(wait(lambda: self.win.drive_page is not None))
+        self.assertIn("Update", self.win.nav_titles())
+        self.assertEqual(self.win.current_view(), "update")
+        self.assertEqual(len(self.show_every_view()), 12)
+        self.win.select_view("update")
+        self.watcher.drives_changed.emit([])
+        self.assertTrue(wait(lambda: "update" not in self.win.views))
+        self.assertEqual(self.win.current_view(), "live")
+
+    def test_sidebar_keys_follow_the_order(self):
+        self.plug(C2_PORT)
+        self.win.show()
+        self.win.activateWindow()
+        QTest.qWaitForWindowActive(self.win)
+        for i, key in enumerate(self.win.view_order()[:9]):
+            QTest.keyClick(self.win, Qt.Key_1 + i, Qt.ControlModifier)
+            self.assertEqual(self.win.current_view(), key)
+
+    def test_theme_switch_rebuilds_the_sheet_and_the_plots(self):
+        app = QApplication.instance()
+        self.settings.set("theme", "dark")
+        self.win.apply_theme()
+        dark_sheet = app.styleSheet()
+        dark_bg = self.win.trend.plot.backgroundBrush().color().name()
+        self.assertEqual(dark_bg, style.DARK["panel-2"].name())
+        self.assertIn(style.qss(style.DARK["body"]), dark_sheet)
+        self.win.prefs.theme.setCurrentIndex(self.win.prefs.theme.findData("light"))
+        self.assertEqual(self.settings.get("theme"), "light")
+        self.assertNotEqual(app.styleSheet(), dark_sheet)
+        self.assertIn(style.qss(style.LIGHT["body"]), app.styleSheet())
+        self.assertEqual(self.win.trend.plot.backgroundBrush().color().name(),
+                         style.LIGHT["panel-2"].name())
+        self.assertEqual(self.win.live.mini.backgroundBrush().color().name(),
+                         style.LIGHT["panel-2"].name())
+        self.assertEqual(app.palette().color(app.palette().ColorRole.Window).name(),
+                         style.LIGHT["body"].name())
+        self.assertEqual(style._state["style"].name(), "fusion")
+        self.assertEqual(app.style().metaObject().className(), "QStyleSheetStyle")
+
+    def test_seven_segment_characters(self):
+        for ch, segs in widgets.SEGMENTS.items():
+            self.assertEqual(widgets.segments_of(ch), segs)
+            self.assertTrue(set(segs) <= set("abcdefg"))
+            self.assertTrue(segs or ch == " ", ch)
+        self.assertEqual(widgets.segments_of("T"), widgets.SEGMENTS["t"])    # the other case
+        self.assertIsNone(widgets.segments_of("Ω"))                          # a blank
+        self.assertIsNone(widgets.segments_of("K"))
+        self.assertEqual(widgets.cells_of("1.5"), [("1", True), ("5", False)])
+        self.assertEqual(widgets.cells_of(".OL"), [(" ", True), ("O", False), ("L", False)])
+        self.assertEqual(widgets.split_reading("100.00 nF"), ("100.00", "nF"))
+        self.assertEqual(widgets.split_reading("4.70 kΩ"), ("4.70", "kΩ"))
+        self.assertEqual(widgets.split_reading(".OL"), (".OL", ""))
+        seg = widgets.SevenSegment(4)
+        seg.resize(400, 60)
+        for theme in ("dark", "light"):
+            style.apply(None, theme)
+            for ch in widgets.SEGMENTS:
+                seg.setText(ch + "." + ch)
+                self.assertFalse(seg.grab().isNull())
+        self.win.apply_theme()
+
+    def test_lc1020e_annunciators_from_the_records(self):
+        self.plug(LC_PORT)
+        live = self.win.live
+        self.assertEqual(live.big.words, ["AUTO", "HOLD", "SER", "PAR"])
+        self.lc_meter.pending.append((lc.MEASURE, fl.build_measure(parallel=1)))
+        self.done(self.page("Diagnostics").ping())
+        self.assertTrue(wait(lambda: live.last is not None))
+        lcr = self.page("LCR")
+        self.assertTrue(wait(lambda: 2 in lcr.combos and lcr.state is not None))
+        # STATE circuit 0 (auto): series / parallel from the MEASURE record (parallel 1)
+        self.assertEqual(live.big.lit, {"PAR"})
+        self.assertEqual(live.big.mode, "1kHz 0.6V")              # FREQ and AMP choices
+        self.done(lcr._hold(True))
+        self.assertIn("HOLD", live.big.lit)
+        self.assertNotIn("AUTO", live.big.lit)                     # no RANGE list answered
+        self.assertEqual(live.big.secondary[:2], ("D", "0.0012"))
+        self.assertEqual(live.big.quantity, "C")
+        self.assertEqual(len(self.page("Keys").live_buttons), 12)
+        self.done(self.page("Keys").press(9, 0))
+        self.assertIn((lc.KEY, struct.pack("<BH", 9, 0)), self.lc_meter.log)
+
+    def test_2c53t_annunciators_from_the_records(self):
+        self.plug(C2_PORT)
+        live = self.win.live
+        self.assertEqual(live.big.words, ["AUTO", ".OL", "CAL", "PAS", "Er"])
+        self.c2_meter.state_kw["status"] = 6                       # Er1
+        self.done(self.page("Diagnostics").state())
+        self.assertEqual(live.big.lit, {"Er"})
+        self.assertEqual(live.big.mode, "R")
+        self.assertIsNone(live.big.secondary)
+        keys = self.page("Keys")
+        self.assertEqual(sorted(keys.live_buttons), [2, 4, 7, 13, 14, 15, 22])
+        self.assertEqual(keys.live_buttons[15].text(), "hold")
+        self.assertEqual(keys.live_buttons[22].sub, "long press")
+        self.done(keys.press(15))
+        self.assertEqual(self.c2_meter.keys, [15])
+
+    def test_header_chips(self):
+        self.assertTrue(self.win.fw_chip.isHidden())
+        self.plug(LC_PORT)
+        w = self.win
+        self.assertEqual(w.fw_chip.text(), "Firmware V1.1 OWN")
+        self.assertEqual(w.boot_chip.text(), "Bootloader A·v2")
+        self.assertEqual(w.port_chip.text(), LC_PORT.device)
+        self.assertIn(LC_SERIAL, w.port_chip.toolTip())
+        self.assertTrue(w.connect_button.isHidden() and not w.disconnect_button.isHidden())
+        self.assertTrue(w.device_list.isHidden())                  # one meter, no failure
+        self.win.disconnect_active()
+        self.settle()
+        self.assertFalse(w._chip_wanted[w.fail_chip])              # closed by hand
+        self.denied.add(C2_PORT.device)
+        self.plug(LC_PORT, C2_PORT)
+        self.assertTrue(w._chip_wanted[w.fail_chip])
+        self.assertIn("permission denied", w.fail_chip.toolTip())
+        self.assertFalse(w.device_list.isHidden())
 
 
 if __name__ == "__main__":

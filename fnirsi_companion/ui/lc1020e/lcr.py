@@ -1,10 +1,17 @@
-"""LC1020E LCR and Compare pages.
+"""LC1020E measurement controls (the "Measurement" card of the Live page) and the Compare page.
 
 LCR (SL 5.3, 8.1): one selector per LCR_TABLES list, built from the meter's own lists (names,
-units, entry texts); a choice sends LCR_SET with the list id as the setting (the LCR_SET setting
-numbers are the list ids, SL 5.3) and the selectors then show the meter's STATE: setting 0 Func,
-1 secondary, 2 frequency, 3 level, 4 bias, 5 range, 6 speed, 7 circuit mode, compared by the list's
-value type (index, u32, f32). HOLD (SL 5.3) and the screen (SCREEN, SL 5.2) show STATE too.
+units, entry texts): a segmented control for lists of up to 6 entries, a combo box for longer
+ones. A choice sends LCR_SET with the list id as the setting (the LCR_SET setting numbers are the
+list ids, SL 5.3) and the selectors then show the meter's STATE: setting 0 Func, 1 secondary,
+2 frequency, 3 level, 4 bias, 5 range, 6 speed, 7 circuit mode, compared by the list's value type
+(index, u32, f32). HOLD (SL 5.3) and the screen (SCREEN, SL 5.2) show STATE too.
+
+The page also gives the Live page's LCD its annunciators (DESIGN_UI 6.5): HOLD from the STATE flag
+"hold"; SER / PAR from STATE's circuit mode (1 series, 2 parallel) or, in auto (0), from the
+series / parallel byte of the MEASURE record (PROTOCOL.md: 0 series, 1 parallel; the last field of
+the reading's key, devices.lc1020e.measure_to_reading); AUTO when the current choice of the meter's
+RANGE list (setting 5) reads "AUTO"; the mode text is the current choices of FREQ (2) and AMP (3).
 
 Compare (SL 5.3, 6.3): the COMPARE record (refreshed while the page is shown, one request
 outstanding), and COMPARE_SET with the limits of SL 5.3.1; the form shows what the meter stored.
@@ -15,15 +22,19 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
-                               QLabel, QPushButton)
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel,
+                               QPushButton)
 
 from ...devices import lc1020e as lc
-from ..base import Page, describe_error, group, row
+from ..base import Page, describe_error
+from ..widgets import Card, Segmented, StatRow, label, set_kind
 
 # STATE field of each LCR_SET setting / LCR_TABLES list id (SL 5.3 table "Settings of LCR_SET")
 STATE_FIELD = {0: "func", 1: "secondary", 2: "frequency", 3: "level", 4: "bias", 5: "range",
                6: "speed", 7: "circuit"}
+SEGMENTED_MAX = 6          # lists of up to this many entries get a segmented control
+LCD_WORDS = ["AUTO", "HOLD", "SER", "PAR"]
+KEY_PARALLEL = 9           # index of the series / parallel byte in the reading's key
 
 
 def entry_index(lst: lc.LcrList, value) -> int:
@@ -44,23 +55,36 @@ class LcrPage(Page):
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
         self.lists: dict[int, lc.LcrList] = {}
-        self.combos: dict[int, QComboBox] = {}
+        self.combos: dict[int, object] = {}
         self.notes: dict[int, QLabel] = {}
+        card = Card("Measurement")
+        self.reload_button = self.control(set_kind(QPushButton("Read the lists again"), "small"),
+                                          lc.LCR_TABLES)
+        self.reload_button.clicked.connect(self.load)
+        card.add_right(self.reload_button)
         self.grid = QGridLayout()
-        self.body.addWidget(group("Measurement settings (the meter's own lists)", self.grid))
-        self.hold = self.control(QCheckBox("HOLD"), lc.HOLD)
+        self.grid.setHorizontalSpacing(12)
+        self.grid.setVerticalSpacing(8)
+        self.grid.setColumnStretch(2, 1)
+        card.add(self.grid)
+        self.hold = self.control(QPushButton("HOLD"), lc.HOLD)
+        self.hold.setCheckable(True)
         self.hold.clicked.connect(self._hold)
-        self.screen_combo = self.control(QComboBox(), lc.SCREEN)
+        self.screen_combo = self.control(Segmented(), lc.SCREEN)
         for n, name in lc.SCREEN_NAME.items():
             self.screen_combo.addItem(name, n)
         self.screen_combo.activated.connect(self._screen)
-        self.reload_button = self.control(QPushButton("Read the lists again"), lc.LCR_TABLES)
-        self.reload_button.clicked.connect(self.load)
-        self.body.addLayout(row(self.hold, "Screen:", self.screen_combo, self.reload_button))
-        self.flags = QLabel("—")
-        self.flags.setWordWrap(True)
-        self.body.addLayout(row("Meter state:", self.flags))
-        self.body.addStretch(1)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(8)
+        bottom.addWidget(self.hold)
+        bottom.addSpacing(12)
+        bottom.addWidget(label("Screen", "label"))
+        bottom.addWidget(self.screen_combo)
+        bottom.addStretch(1)
+        card.add(bottom)
+        self.flags = label("—", "hint", word_wrap=True)
+        card.add(self.flags)
+        self.body.addWidget(card)
         self.state = None
         if device.has(lc.LCR_TABLES):
             self.load()
@@ -93,20 +117,20 @@ class LcrPage(Page):
         self.notes.clear()
         for r, (lid, lst) in enumerate(lists):
             if isinstance(lst, Exception):
-                self.grid.addWidget(QLabel("list %d" % lid), r, 0)
-                self.grid.addWidget(QLabel("not answered: %s" % describe_error(lst, lc.STATUS_NAME)),
-                                    r, 1)
+                self.grid.addWidget(label("list %d" % lid), r, 0)
+                self.grid.addWidget(label("not answered: %s" % describe_error(lst, lc.STATUS_NAME),
+                                          "hint", word_wrap=True), r, 1, 1, 2)
                 continue
             self.lists[lid] = lst
-            self.grid.addWidget(QLabel(lst.name + (" (%s)" % lst.unit if lst.unit else "")), r, 0)
-            combo = QComboBox()
+            self.grid.addWidget(label(lst.name + (" (%s)" % lst.unit if lst.unit else "")), r, 0)
+            combo = Segmented() if len(lst.entries) <= SEGMENTED_MAX else QComboBox()
             combo.setObjectName("lcr_%d" % lid)
             for v, text in lst.entries:
                 combo.addItem(text, v)
             combo.activated.connect(lambda idx, lid=lid: self.set_value(lid, idx))
             self.control(combo, lc.LCR_SET)
             self.grid.addWidget(combo, r, 1)
-            note = QLabel("")
+            note = label("", "hint")
             self.grid.addWidget(note, r, 2)
             self.combos[lid] = combo
             self.notes[lid] = note
@@ -162,6 +186,38 @@ class LcrPage(Page):
         self.flags.setText("screen %s; flags: %s; dropped stream frames %d" % (
             lc.SCREEN_NAME.get(st.screen, st.screen), ", ".join(names) or "none", st.dropped))
 
+    # -- the Live page's LCD ------------------------------------------------------------------
+    def _choice_text(self, lid: int) -> str | None:
+        """The text of the meter's current choice of list lid (from STATE), or None."""
+        lst, st = self.lists.get(lid), self.state
+        field = STATE_FIELD.get(lid)
+        if lst is None or st is None or field is None:
+            return None
+        i = entry_index(lst, getattr(st, field))
+        return lst.entries[i][1] if i >= 0 else None
+
+    def lcd_flags(self, reading) -> tuple[set, str]:
+        """(lit annunciator words, mode text) for the Live page (module docstring)."""
+        lit: set = set()
+        st = self.state
+        if st is not None:
+            if st.flag("hold"):
+                lit.add("HOLD")
+            if st.circuit == 1:
+                lit.add("SER")
+            elif st.circuit == 2:
+                lit.add("PAR")
+            elif st.circuit == 0 and reading is not None and len(reading.key) > KEY_PARALLEL:
+                parallel = reading.key[KEY_PARALLEL]
+                if parallel == 0:
+                    lit.add("SER")
+                elif parallel == 1:
+                    lit.add("PAR")
+        if self._choice_text(5) == "AUTO":
+            lit.add("AUTO")
+        mode = " ".join(t for t in (self._choice_text(2), self._choice_text(3)) if t)
+        return lit, mode
+
 
 class ComparePage(Page):
     title = "Compare"
@@ -169,46 +225,61 @@ class ComparePage(Page):
 
     def __init__(self, ctx, device):
         super().__init__(ctx, device)
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        self.body.addLayout(top)
         self.labels = {}
-        form = QFormLayout()
-        for key, name in (("quantity", "Quantity"), ("nominal", "Nominal"),
-                          ("tolerance", "Tolerance %"), ("deviation", "Deviation %"),
-                          ("ok", "Verdict"), ("passed", "Passed"), ("failed", "Failed"),
-                          ("value", "Value"), ("warn", "Warn type / sound / LED")):
-            lab = QLabel("—")
-            lab.setObjectName("cmp_" + key)
-            form.addRow(name, lab)
-            self.labels[key] = lab
-        self.refresh_button = self.control(QPushButton("Read COMPARE"), lc.COMPARE)
+        rec = Card("COMPARE")
+        self.refresh_button = self.control(set_kind(QPushButton("Read COMPARE"), "small"),
+                                           lc.COMPARE)
         self.refresh_button.clicked.connect(self.refresh)
-        form.addRow(self.refresh_button)
-        self.body.addWidget(group("COMPARE (the meter's counters and verdict)", form))
+        rec.add_right(self.refresh_button)
+        items = (("quantity", "Quantity"), ("nominal", "Nominal"),
+                 ("tolerance", "Tolerance %"), ("deviation", "Deviation %"),
+                 ("ok", "Verdict"), ("passed", "Passed"), ("failed", "Failed"),
+                 ("value", "Value"), ("warn", "Warn type / sound / LED"))
+        for i, (key, name) in enumerate(items):
+            r = StatRow(name, line=i < len(items) - 1)
+            r.value.setObjectName("cmp_" + key)
+            rec.add(r)
+            self.labels[key] = r.value
+        rec.add(label("The meter's counters and verdict, read every second while this page is "
+                      "shown.", "hint", word_wrap=True))
+        top.addWidget(rec, 1)
 
+        form = Card("COMPARE_SET")
         self.nominal = QDoubleSpinBox()
         self.nominal.setDecimals(3)
         self.nominal.setRange(0.001, 999999999.0)
         self.tolerance = QDoubleSpinBox()
         self.tolerance.setDecimals(1)
         self.tolerance.setRange(0.0, 99.9)
-        self.warn_type = QComboBox()
-        self.warn_type.addItems(["0 NG", "1 OK"])        # SL 8.2 setting 3 choices
-        self.warn_sound = QComboBox()
-        self.warn_sound.addItems(["0", "1"])
-        self.warn_led = QComboBox()
-        self.warn_led.addItems(["0", "1"])
+        self.warn_type = Segmented(["0 NG", "1 OK"])        # SL 8.2 setting 3 choices
+        self.warn_sound = Segmented(["0", "1"])
+        self.warn_led = Segmented(["0", "1"])
         self.set_button = self.control(QPushButton("COMPARE_SET"), lc.COMPARE_SET)
         self.set_button.clicked.connect(self.apply)
-        f2 = QFormLayout()
-        f2.addRow("Nominal (0.001 .. < 1e9)", self.nominal)
-        f2.addRow("Tolerance % (0 .. 99.9)", self.tolerance)
-        f2.addRow("Warn type", self.warn_type)
-        f2.addRow("Warn sound", self.warn_sound)
-        f2.addRow("Warn LED", self.warn_led)
-        f2.addRow(self.set_button)
-        f2.addRow(QLabel("The meter stores the nominal as a scale and five digits and the "
-                         "tolerance in tenths of a percent (SL 5.3.1); the form shows what it "
-                         "stored. RAM only, not saved."))
-        self.body.addWidget(group("COMPARE_SET", f2))
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(10)
+        for r, (name, w) in enumerate((("Nominal (0.001 .. < 1e9)", self.nominal),
+                                       ("Tolerance % (0 .. 99.9)", self.tolerance),
+                                       ("Warn type", self.warn_type),
+                                       ("Warn sound", self.warn_sound),
+                                       ("Warn LED", self.warn_led))):
+            g.addWidget(label(name), r, 0)
+            g.addWidget(w, r, 1)
+        g.setColumnStretch(2, 1)
+        form.add(g)
+        b = QHBoxLayout()
+        b.addWidget(self.set_button)
+        b.addStretch(1)
+        form.add(b)
+        form.add(label("The meter stores the nominal as a scale and five digits and the "
+                       "tolerance in tenths of a percent (SL 5.3.1); the form shows what it "
+                       "stored. RAM only, not saved.", "hint", word_wrap=True))
+        form.body.addStretch(1)
+        top.addWidget(form, 1)
         self.body.addStretch(1)
         self.pending = None
         self.timer = QTimer(self)
