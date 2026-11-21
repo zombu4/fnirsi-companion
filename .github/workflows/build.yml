@@ -1,0 +1,264 @@
+# FNIRSI Companion: unit tests on macOS, Windows and Linux (Python 3.11, Qt offscreen) on every push and pull request;
+# packages (macOS .dmg for Apple silicon and Intel, Windows installer .exe, Linux AppImage and .deb) only on a tag vA.B.C
+# or a run started by hand.  Every package is started with --no-autoconnect (.github/scripts/smoke.py) before it is
+# uploaded.  On a tag the packages and their checksums are attached to the GitHub release of that tag.
+#
+# macOS signing: Developer ID signing and notarization only when all five secrets exist: MACOS_CERT_P12 (the .p12 of the
+# Developer ID Application certificate and key, base64), MACOS_CERT_PASSWORD, NOTARY_KEY_P8 (App Store Connect API key,
+# base64), NOTARY_KEY_ID, NOTARY_ISSUER.  Without them the build is unsigned (the disk image carries the steps macOS asks
+# for) and the run says so; a tag build does not fail for it.
+name: Build
+
+on:
+  push:
+    branches: ['main']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  REF_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+  PACKAGE: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+  PYINSTALLER: pyinstaller==6.22.3
+
+jobs:
+  tests:
+    name: Unit tests ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: System libraries Qt needs without a display (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libglib2.0-0 libdbus-1-3
+      - name: Python packages
+        run: python -m pip install -r requirements.txt
+      - name: Unit tests (no meter)
+        run: python -m unittest discover -s tests -v
+
+  macos:
+    name: macOS ${{ matrix.arch }} package
+    needs: tests
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, arch: arm64}
+          - {runner: macos-15-intel, arch: x86_64}
+    runs-on: ${{ matrix.runner }}
+    env:
+      SIGN: ${{ secrets.MACOS_CERT_P12 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.NOTARY_KEY_P8 != '' && secrets.NOTARY_KEY_ID != '' && secrets.NOTARY_ISSUER != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Version (a tag must match __version__)
+        run: python -I .github/scripts/version.py "$REF_TAG" >> "$GITHUB_ENV"
+      - name: Python packages
+        run: python -m pip install -r requirements.txt "$PYINSTALLER"
+      - name: Icons and third-party licences
+        run: |
+          mkdir -p build
+          python -I packaging/make_icons.py build/icons
+          python -I packaging/third_party.py build/THIRD_PARTY_LICENSES.txt
+      - name: Application bundle
+        run: APP_VERSION="$VER" APP_ICON="$PWD/build/icons/fnirsi-companion.icns" pyinstaller --noconfirm packaging/companion.spec
+      - name: No signing secrets
+        if: env.SIGN != 'true'
+        run: |
+          echo "::warning::The five macOS signing secrets are not set, so this disk image is NOT signed or notarized."
+      - name: Signing keychain (temporary, deleted at the end of the job)
+        if: env.SIGN == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          kc="$RUNNER_TEMP/sign.keychain-db"
+          echo "SIGN_KC=$kc" >> "$GITHUB_ENV"           # first, so the cleanup step runs even if a later line fails
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT       # the private key never stays on the runner's disk
+          kp=$(openssl rand -hex 24)
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kp" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # exactly one Developer ID Application identity must be in the keychain; it is used by its hash
+          n=$(security find-identity -v -p codesigning "$kc" | grep -c '"Developer ID Application' || true)
+          [ "$n" = 1 ] || { echo "expected 1 Developer ID Application identity, found $n"; exit 1; }
+          id=$(security find-identity -v -p codesigning "$kc" | awk '/"Developer ID Application/ {print $2; exit}')
+          echo "SIGN_ID=$id" >> "$GITHUB_ENV"
+      - name: Sign the application (Developer ID, hardened runtime)
+        if: env.SIGN == 'true'
+        run: sh packaging/sign_macos.sh "dist/FNIRSI Companion.app" "$SIGN_ID" "$SIGN_KC"
+      - name: The bundle starts and ends
+        run: python -I .github/scripts/smoke.py "dist/FNIRSI Companion.app/Contents/MacOS/fnirsi-companion"
+      - name: Disk image
+        run: SIGNED=$([ "$SIGN" = true ] && echo 1 || echo 0) sh packaging/make_dmg.sh "dist/FNIRSI Companion.app" build/THIRD_PARTY_LICENSES.txt "FNIRSI-Companion-$VER-macos-${{ matrix.arch }}.dmg"
+      - name: Sign and notarize the disk image (stapled)
+        if: env.SIGN == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          dmg="FNIRSI-Companion-$VER-macos-${{ matrix.arch }}.dmg"
+          trap 'rm -f "$RUNNER_TEMP/notary.p8"' EXIT
+          codesign --force --timestamp --sign "$SIGN_ID" --keychain "$SIGN_KC" "$dmg"
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          NOTARY_KEY="$RUNNER_TEMP/notary.p8" sh packaging/notarize_macos.sh "$dmg"
+      - name: Remove the signing keychain
+        if: always() && env.SIGN == 'true'
+        run: |
+          security delete-keychain "$SIGN_KC" || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-macos-${{ matrix.arch }}
+          path: FNIRSI-Companion-*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 package
+    needs: tests
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Version (a tag must match __version__)
+        run: python -I .github/scripts/version.py "$REF_TAG" >> "$GITHUB_ENV"
+      - name: Python packages
+        run: python -m pip install -r requirements.txt "$PYINSTALLER"
+      - name: Icons and third-party licences
+        run: |
+          mkdir -p build
+          python -I packaging/make_icons.py build/icons
+          python -I packaging/third_party.py build/THIRD_PARTY_LICENSES.txt
+      - name: Program folder
+        run: APP_VERSION="$VER" APP_ICON="$PWD/build/icons/fnirsi-companion.ico" pyinstaller --noconfirm packaging/companion.spec
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$env:VER" "/DSourceDir=$PWD\dist\fnirsi-companion" "/DOutputDir=$PWD" `
+            "/DLicenseFile=$PWD\LICENSE" "/DThirdParty=$PWD\build\THIRD_PARTY_LICENSES.txt" packaging\windows\fnirsi_companion.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Installed program starts and ends
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem "FNIRSI-Companion-*-windows-x64.exe" | Select-Object -First 1
+          $dir = Join-Path $PWD "installed"
+          Start-Process -FilePath $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir" -Wait
+          python -I .github/scripts/smoke.py (Join-Path $dir "fnirsi-companion.exe")
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-windows
+          path: FNIRSI-Companion-*-windows-x64.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 package
+    needs: tests
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: System libraries (Qt without a display, libxcb-cursor0 for the AppImage)
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libglib2.0-0 libdbus-1-3 libxcb-cursor0
+      - name: Version (a tag must match __version__)
+        run: python -I .github/scripts/version.py "$REF_TAG" >> "$GITHUB_ENV"
+      - name: Python packages
+        run: python -m pip install -r requirements.txt "$PYINSTALLER"
+      - name: Icons and third-party licences
+        run: |
+          mkdir -p build
+          python -I packaging/make_icons.py build/icons
+          python -I packaging/third_party.py build/THIRD_PARTY_LICENSES.txt
+      - name: Program folder
+        run: APP_VERSION="$VER" pyinstaller --noconfirm packaging/companion.spec
+      - name: AppImage
+        run: |
+          set -euo pipefail
+          curl -fsSL -o appimagetool.AppImage https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool.AppImage" | sha256sum -c -
+          chmod +x appimagetool.AppImage
+          sh packaging/linux/build_appimage.sh dist/fnirsi-companion build/THIRD_PARTY_LICENSES.txt \
+            "FNIRSI-Companion-$VER-linux-x86_64.AppImage" build/icons/fnirsi-companion.png "$PWD/appimagetool.AppImage"
+      - name: The AppImage starts and ends
+        run: APPIMAGE_EXTRACT_AND_RUN=1 python -I .github/scripts/smoke.py "$PWD/FNIRSI-Companion-$VER-linux-x86_64.AppImage"
+      - name: Debian package, installed and started
+        run: |
+          set -euo pipefail
+          deb="FNIRSI-Companion-$VER-linux-amd64.deb"
+          sh packaging/linux/build_deb.sh dist/fnirsi-companion "$REF_TAG" build/THIRD_PARTY_LICENSES.txt "$deb" build/icons/fnirsi-companion.png
+          sudo apt-get install -y "./$deb"
+          test -f /usr/lib/udev/rules.d/60-fnirsi.rules
+          python -I .github/scripts/smoke.py /usr/bin/fnirsi-companion
+          sudo apt-get remove -y fnirsi-companion
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-linux
+          path: |
+            FNIRSI-Companion-*.AppImage
+            FNIRSI-Companion-*.deb
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [macos, windows, linux]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          (cd assets && python3 -I ../.github/scripts/sha256sum.py FNIRSI-Companion-* > SHA256SUMS)
+          python3 -I .github/scripts/release_notes.py CHANGELOG.md "$ver" "https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md" notes.md
+      - name: Create the release and attach the files
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "FNIRSI Companion ${GITHUB_REF_NAME}" --notes-file notes.md
+          gh release upload "$GITHUB_REF_NAME" assets/* --clobber

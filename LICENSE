@@ -1,0 +1,65 @@
+FNIRSI Companion - Non-Commercial License
+
+Copyright (c) 2026 zombu4. All rights reserved except as granted below.
+
+1. Scope
+
+   "The Work" means the original contributions of the copyright holder in this repository: source
+   code, scripts, build files and documentation of the FNIRSI Companion program. Third-party
+   software bundled with builds of the Work (see section 8) is not licensed by this document.
+
+2. Permitted use
+
+   Individuals may, free of charge, for personal, home, hobby, enthusiast, educational and research
+   purposes that are not commercial:
+
+   a) use the Work and builds of it with devices they own;
+   b) study and modify the Work;
+   c) share the Work, modified or unmodified, free of charge, provided that this license and the
+      copyright notice are kept in full, modified files are marked as modified, and the source is
+      made available with any shared build.
+
+3. Not permitted without prior written authorization from the copyright holder
+
+   a) any use by or on behalf of a company, business, organization or government body, or any use
+      in connection with a commercial activity;
+   b) selling, reselling, renting or licensing the Work or any build of it, alone or as part of
+      anything else;
+   c) bundling, pre-installing or distributing the Work or any build of it with hardware, devices,
+      software products or services, whether paid or free;
+   d) offering services that use the Work for payment;
+   e) removing or altering this license or the copyright notice;
+   f) using the Work, or parts of it, in another product, program or project that is not
+      distributed under this same license.
+
+   Authorization is valid only in writing from the copyright holder and only for the use it names.
+
+4. No warranty
+
+   THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+   LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+5. Limitation of liability
+
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGE OR OTHER LIABILITY ARISING
+   FROM THE WORK OR ITS USE, INCLUDING DAMAGE TO DEVICES, LOSS OF CALIBRATION OR DATA, OR INCORRECT
+   MEASUREMENTS. Installing firmware or bootloaders and saving settings can make a device unusable;
+   you do it at your own risk.
+
+6. Termination
+
+   Any use outside sections 2 and 3 ends all rights under this license automatically.
+
+7. Contributions
+
+   Contributions submitted to this repository are accepted under this license, and the contributor
+   grants the copyright holder the right to use them under any terms.
+
+8. Third-party software and trademarks
+
+   Builds of the Work include third-party software under its own licenses, among them Qt and Qt for
+   Python (PySide6, shiboken6) under the GNU Lesser General Public License version 3, pyqtgraph,
+   numpy and pyserial; their license texts are shipped with every build in
+   THIRD_PARTY_LICENSES.txt. Nothing in this license restricts the rights those licenses give,
+   including replacing the Qt libraries of a build. This project is not affiliated with or
+   endorsed by FNIRSI. FNIRSI and the product names are trademarks of their owners.

@@ -1,0 +1,756 @@
+"""UI tests (offscreen): the main window with a fake watcher and the fake meters of both models on
+real SerialLinks (FakeSerial as the serial_factory result). Auto-detect and switch, unplug /
+replug, identification refusals, the typed confirmation, an exclusive job blocking the switch,
+every page built and its main actions driven against the fakes, the update-drive page.
+
+Run: QT_QPA_PLATFORM=offscreen ../.venv/bin/python -I -m unittest discover -s tests -p test_ui.py
+"""
+
+import os
+import struct
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PySide6.QtCore import QObject, Qt, Signal                       # noqa: E402
+from PySide6.QtTest import QSignalSpy, QTest                     # noqa: E402
+from PySide6.QtWidgets import QApplication                       # noqa: E402
+
+_app = QApplication.instance() or QApplication([])
+
+import fake_2c53t as f2                                          # noqa: E402
+import fake_lc1020e as fl                                        # noqa: E402
+import test_releases                                             # noqa: E402
+from fnirsi_companion import __main__ as main_mod                # noqa: E402
+from fnirsi_companion.core import settings as settings_mod       # noqa: E402
+from fnirsi_companion.devices import c2c53t as c2                # noqa: E402
+from fnirsi_companion.devices import lc1020e as lc               # noqa: E402
+from fnirsi_companion.devices import base as base_mod            # noqa: E402
+from fnirsi_companion.link.discover import DriveInfo, PortInfo, Volume   # noqa: E402
+from fnirsi_companion.ui import confirm as confirm_mod           # noqa: E402
+from fnirsi_companion.ui.main_window import MainWindow           # noqa: E402
+
+LC_SERIAL = fl.INVENTED_UID.hex().upper()
+C2_SERIAL = "5A4B3C2D1E0F"                 # invented 12-digit hex ID string (DESIGN 13.18)
+LC_PORT = PortInfo("LC1020E", "/dev/cu.fake-lc", LC_SERIAL, 0x19F5, 0x1020)
+C2_PORT = PortInfo("2C53T", "/dev/cu.fake-2c", C2_SERIAL, 0x2E3C, 0x2C53)
+
+
+def _quiet(cls):
+    """A FakeSerial whose empty read waits a little, as a port's read timeout does (no busy loop
+    of the link worker)."""
+    class Quiet(cls):
+        def read(self, n=1):
+            if not self._rx:
+                time.sleep(0.002)
+                return b""
+            return super().read(n)
+    return Quiet
+
+
+LcSerial, C2Serial = _quiet(fl.FakeSerial), _quiet(f2.FakeSerial)
+
+
+class FakeWatcher(QObject):
+    meters_changed = Signal(list)
+    drives_changed = Signal(list)
+    scan_failed = Signal(str)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+def no_releases(url):
+    """GitHub stand-in: every release list is empty."""
+    return b"[]"
+
+
+def wait(cond, timeout=8.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        QApplication.processEvents()
+        if cond():
+            return True
+        time.sleep(0.003)
+    QApplication.processEvents()
+    return cond()
+
+
+class Bench(unittest.TestCase):
+    """A window with fake meters behind the device names of LC_PORT and C2_PORT."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = self.tmp.name
+        self.settings = settings_mod.Settings(os.path.join(d, "cfg", "settings.json"))
+        self.settings.set("backups_folder", os.path.join(d, "backups"))
+        self.settings.set("recordings_folder", os.path.join(d, "rec"))
+        self.settings.set("update_check", "never")
+        self.lc_meter = fl.FakeMeter()
+        self.c2_meter = f2.FakeMeter()
+        self.meters = {LC_PORT.device: self.lc_meter, C2_PORT.device: self.c2_meter}
+        self.denied = set()
+        self.answers = []
+        self.asked = []
+        self.watcher = FakeWatcher()
+        self.volumes = []                  # what the volume probe finds (no ioreg / sysfs here)
+        self.yes_no = []
+        self.win = MainWindow(self.settings, watcher=self.watcher, serial_factory=self.factory,
+                              release_get=no_releases, cache_dir=os.path.join(d, "cache"),
+                              confirmer=self.confirmer, asker=self.asker,
+                              volume_probe=lambda wanted: list(self.volumes))
+        self.win.reconnect_gone_wait = 0.05
+        self.addCleanup(self.close)
+
+    def close(self):
+        self.win.shutdown()
+        self.win.deleteLater()
+        QApplication.processEvents()
+
+    def factory(self, port):
+        if port in self.denied:
+            raise PermissionError(13, "Permission denied: %r" % port)
+        m = self.meters[port]
+        return LcSerial(m) if isinstance(m, fl.FakeMeter) else C2Serial(m)
+
+    def asker(self, title, text):
+        self.asked.append((title, text))
+        return self.yes_no.pop(0) if self.yes_no else False
+
+    def confirmer(self, title, text):
+        self.asked.append((title, text))
+        return self.answers.pop(0) if self.answers else "OK"
+
+    # -- helpers --------------------------------------------------------------------------------
+    def settle(self, timeout=10.0):
+        self.assertTrue(wait(lambda: not self.win.jobs.running and self.win.connecting is None,
+                             timeout), "jobs still running: %s"
+                        % [j.what for j in self.win.jobs.running])
+
+    def plug(self, *ports):
+        self.watcher.meters_changed.emit(list(ports))
+        self.settle()
+
+    def connected(self, model):
+        a = self.win.active
+        return a is not None and a.device.model == model
+
+    def page(self, title):
+        for p in self.win.active.pages:
+            if p.title == title:
+                return p
+        self.fail("no page %r" % title)
+
+    def done(self, job, timeout=10.0):
+        self.assertIsNotNone(job, "the job was refused")
+        self.assertTrue(wait(job.done.is_set, timeout), "job %s did not end" % job.what)
+        QApplication.processEvents()
+        return job
+
+
+# ----------------------------------------------------------------------------------------------
+class DetectAndSwitch(Bench):
+    def test_auto_detect_and_switch_to_a_new_meter(self):
+        self.plug(LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        titles = [self.win.tabs.tabText(i) for i in range(self.win.tabs.count())]
+        self.assertEqual(titles, ["Live", "Trend", "Log", "LCR", "Compare", "Settings",
+                                  "Calibration", "Backup", "Keys", "Meter", "Screenshot",
+                                  "Diagnostics", "Events", "Preferences"])
+        self.assertIn(lc.MEASURE_STREAM, self.lc_meter.cmds())
+        self.assertEqual(self.lc_meter.measure_stream, 0)
+        self.plug(LC_PORT, C2_PORT)
+        self.assertTrue(self.connected("2C53T"))
+        titles = [self.win.tabs.tabText(i) for i in range(self.win.tabs.count())]
+        self.assertEqual(titles[3:12], ["Multimeter", "Oscilloscope", "Generator", "Files",
+                                        "Settings", "Keys", "Meter", "Screenshot", "Diagnostics"])
+        self.assertEqual(self.lc_meter.measure_stream, 0xFFFF)       # stopped when switched away
+        # 13.1: the 2C53T's calibration page backed up at its first identification
+        folder = os.path.join(self.tmp.name, "backups", "2C53T-" + f2.INVENTED_UID.hex().upper())
+        self.assertEqual(len(os.listdir(folder)), 1)
+        self.assertEqual(self.c2_meter.stream_period, 200)
+        items = [self.win.device_list.itemText(i) for i in range(self.win.device_list.count())]
+        self.assertTrue(any("LC1020E" in t for t in items) and any("— active" in t for t in items))
+
+    def test_no_switch_when_the_preference_is_off(self):
+        self.settings.set("switch_to_new_meter", False)
+        self.plug(LC_PORT)
+        self.plug(LC_PORT, C2_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        self.win.device_list.setCurrentIndex(1)
+        self.win.connect_selected()                                # chosen by hand
+        self.settle()
+        self.assertTrue(self.connected("2C53T"))
+
+    def test_unplug_and_replug_reconnects_by_serial(self):
+        self.plug(LC_PORT)
+        first = self.win.active.link
+        self.plug()
+        self.assertTrue(wait(lambda: self.win.active is None))      # after the link's `lost`
+        self.settle()
+        self.assertEqual(self.win.wanted, ("LC1020E", LC_SERIAL))
+        self.assertIn("waiting for LC1020E", self.win.bar_status.text())
+        self.assertFalse(first.is_open)
+        self.plug(LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        self.assertIsNot(self.win.active.link, first)
+        self.assertIsNone(self.win.wanted)
+        self.assertTrue(any("is back with the same UID" in t for t in self.win.events.lines()))
+
+    def test_a_meter_that_left_is_waited_for(self):
+        self.plug(LC_PORT)
+        self.plug(C2_PORT)                                          # LC gone, 2C53T present
+        self.assertTrue(wait(lambda: self.win.active is None))
+        self.settle()
+        self.assertIsNone(self.win.active)                          # 2C53T not opened by itself
+        self.assertEqual(self.win.wanted, ("LC1020E", LC_SERIAL))
+        self.plug(C2_PORT, LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+
+    def test_meter_answering_as_another_model_is_refused(self):
+        self.meters[C2_PORT.device] = fl.FakeMeter()               # an LC1020E behind a 2C53T ID
+        self.plug(C2_PORT)
+        self.assertIsNone(self.win.active)
+        self.assertIn("meter answers as LC1020E", self.win.device_list.itemText(0))
+
+    def test_permission_denied_is_shown_as_such(self):
+        self.denied.add(LC_PORT.device)
+        self.plug(LC_PORT)
+        self.assertIsNone(self.win.active)
+        self.assertIn("permission denied", self.win.device_list.itemText(0))
+
+    def test_exclusive_job_blocks_the_switch(self):
+        self.plug(LC_PORT)
+        spy = QSignalSpy(self.win.jobs.busy_changed)
+        release = threading.Event()
+        job = self.win.jobs.submit(lambda p: release.wait(10), what="held", exclusive=True)
+        self.assertEqual((spy.count(), spy.at(0)), (1, [True]))
+        self.assertTrue(wait(lambda: self.win.jobs.busy))
+        self.assertFalse(self.win.connect_button.isEnabled())
+        self.assertFalse(self.page("Backup").backup_button.isEnabled())
+        self.watcher.meters_changed.emit([LC_PORT, C2_PORT])
+        wait(lambda: False, 0.2)
+        self.assertTrue(self.connected("LC1020E"))
+        self.assertFalse(self.win.close())                         # not closed under the job
+        self.assertTrue(self.win.active.link.is_open)
+        release.set()
+        self.done(job)
+        self.settle()
+        self.assertTrue(self.connected("2C53T"))
+        self.assertIn([False], [spy.at(i) for i in range(spy.count())])
+
+    def test_typed_confirmation_dialog(self):
+        dlg = confirm_mod.ConfirmDialog(None, "Title", "It saves.")
+        self.assertFalse(dlg.ok_button.isEnabled())
+        QTest.keyClicks(dlg.field, "ok")
+        self.assertFalse(dlg.ok_button.isEnabled())
+        dlg.accept()
+        self.assertIsNone(dlg.word())
+        dlg.field.setText("OK")
+        self.assertTrue(dlg.ok_button.isEnabled())
+        dlg.accept()
+        self.assertEqual(dlg.word(), "OK")
+        dlg2 = confirm_mod.ConfirmDialog(None, "Title", "It saves.")
+        dlg2.field.setText("OK")
+        dlg2.reject()
+        self.assertIsNone(dlg2.word())
+
+    def test_refused_confirmation_sends_nothing(self):
+        self.plug(LC_PORT)
+        page = self.page("Settings")
+        self.answers.append(None)
+        self.assertIsNone(page.save())
+        self.settle()
+        self.assertNotIn(lc.SETTINGS_SAVE, self.lc_meter.cmds())
+        self.assertNotIn(lc.CAL_READ, self.lc_meter.cmds())
+        self.assertIn("not confirmed", page.status.text())
+
+    def test_no_autoconnect_opens_only_the_chosen_meter(self):
+        self.win.autoconnect = False
+        self.plug(LC_PORT)
+        self.assertIsNone(self.win.active)
+        self.win.device_list.setCurrentIndex(0)
+        QTest.mouseClick(self.win.connect_button, Qt.LeftButton)
+        self.settle()
+        self.assertTrue(self.connected("LC1020E"))
+        self.win._show_stats()
+        self.assertIn("frames in", self.win.stats_label.text())
+        self.assertIn("dropped by the meter 0", self.win.stats_label.text())
+        self.win.disconnect_active()
+        self.settle()
+        self.assertIsNone(self.win.active)
+        self.assertIn("disconnected by you", self.win.device_list.itemText(0))
+
+    def test_main_options(self):
+        a = main_mod.parse_args(["--no-autoconnect", "--config-dir", "/x"])
+        self.assertTrue(a.no_autoconnect)
+        self.assertEqual(a.config_dir, "/x")
+
+    # review_r1 finding 12
+    def cancellable_job(self, started):
+        def fn(p):
+            with base_mod.Device._cancellable():
+                p(0.5, "reading the backup")
+                started.set()
+                end = time.monotonic() + 10
+                while time.monotonic() < end:
+                    base_mod.Device._cancel_point()
+                    time.sleep(0.005)
+            return "ran to its end"
+        return fn
+
+    def test_cancel_button_stops_a_job_between_requests(self):
+        self.plug(LC_PORT)
+        started = threading.Event()
+        errors = []
+        job = self.win.jobs.submit(self.cancellable_job(started), what="backup", exclusive=True,
+                                   on_error=errors.append)
+        self.assertTrue(started.wait(5))
+        self.assertTrue(wait(self.win.cancel_button.isEnabled))
+        self.win.cancel_button.click()
+        self.done(job)
+        self.assertIsInstance(errors[0], base_mod.Cancelled)
+        self.assertFalse(self.win.cancel_button.isEnabled())
+
+    def test_close_offers_the_cancel_and_closes_after_the_job(self):
+        self.plug(LC_PORT)
+        started = threading.Event()
+        job = self.win.jobs.submit(self.cancellable_job(started), what="backup", exclusive=True,
+                                   on_error=lambda e: None)
+        self.assertTrue(started.wait(5))
+        self.assertTrue(wait(lambda: job.last_text == "reading the backup"))
+        self.yes_no.append(True)
+        self.assertFalse(self.win.close())                         # not at once
+        self.assertIn("reading the backup", self.asked[-1][1])
+        self.done(job)
+        self.assertTrue(wait(lambda: not self.win.stats_timer.isActive()))   # shut down, closed
+
+    def test_close_during_a_step_that_must_end_says_what_it_waits_for(self):
+        self.plug(LC_PORT)
+        release = threading.Event()
+
+        def fn(p):
+            p(0.9, "FW_INSTALL sent: waiting for the meter")
+            release.wait(10)
+        job = self.win.jobs.submit(fn, what="application update", exclusive=True)
+        self.assertTrue(wait(lambda: job.last_text != ""))
+        n = len(self.asked)
+        self.assertFalse(self.win.close())
+        self.assertEqual(len(self.asked), n)                       # no cancel offered
+        last = self.win.events.list.item(self.win.events.list.count() - 1).text()
+        self.assertIn("cannot be cancelled now", last)
+        self.assertIn("FW_INSTALL sent", last)
+        self.assertFalse(self.win.cancel_job())
+        release.set()
+        self.done(job)
+
+
+# ----------------------------------------------------------------------------------------------
+class Lc1020ePages(Bench):
+    def setUp(self):
+        super().setUp()
+        self.plug(LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        self.dev = self.win.active.device
+
+    def test_live_trend_log_from_the_measure_stream(self):
+        log = self.win.log
+        self.assertTrue(log.start_recording())
+        for _ in range(3):
+            self.lc_meter.pending.append((lc.MEASURE, fl.build_measure()))
+            self.done(self.page("Diagnostics").ping())
+        self.assertTrue(wait(lambda: self.win.live.stats.n >= 3))
+        self.assertEqual(self.win.live.big.text(), "100.00 nF")
+        self.assertEqual(self.win.live.stat_labels["n"].text(), "3")
+        self.win.live.lo_edit.setText("1e-7")
+        self.win.live.hi_edit.setText("2e-7")
+        self.win.live._set_limit()
+        self.assertEqual(self.win.live.verdict_label.text(), "PASS")
+        path = log.stop_recording()
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(self.win.trend.trend), 3)
+        self.win.trend.export()
+        self.assertIn("exported 3 points", self.win.trend.status.text())
+        self.win.trend.cursors.setChecked(True)
+        self.assertIn("C1", self.win.trend.cursor_info.text())
+
+    def test_lcr_selectors_from_the_meter_tables(self):
+        p = self.page("LCR")
+        self.assertTrue(wait(lambda: 2 in p.combos))
+        self.assertEqual(sorted(p.combos), [1, 2, 3])            # the fake answers lists 1..3
+        self.assertEqual([p.combos[2].itemText(i) for i in range(2)], ["100Hz", "1kHz"])
+        self.assertEqual(p.combos[2].currentText(), "1kHz")       # STATE frequency 1000
+        self.done(p.set_value(2, 0))
+        self.assertIn((lc.LCR_SET, bytes([2, 0])), self.lc_meter.log)
+        self.assertEqual(p.combos[2].currentText(), "1kHz")       # the meter still answers 1000
+        self.done(p._hold(True))
+        self.assertTrue(p.hold.isChecked())
+        self.done(p._screen(1))
+        self.assertIn(lc.SCREEN, self.lc_meter.cmds())
+
+    def test_compare_settings_keys(self):
+        cp = self.page("Compare")
+        self.done(cp.refresh())
+        self.assertEqual(cp.labels["passed"].text(), "3")
+        cp.nominal.setValue(47.0)
+        self.done(cp.apply())
+        self.assertEqual(cp.labels["nominal"].text(), "47")
+        sp = self.page("Settings")
+        self.assertTrue(wait(lambda: 2 in sp.editors))
+        self.assertEqual(sorted(sp.editors), [0, 2])
+        sp.editors[2].setCurrentIndex(3)
+        self.done(sp.set_value(2))
+        self.assertIn((lc.SETTINGS_SET, struct.pack("<BH", 2, 3)), self.lc_meter.log)
+        self.done(sp.save())
+        self.assertIn(lc.SETTINGS_SAVE, self.lc_meter.cmds())
+        self.assertIn(lc.CAL_READ, self.lc_meter.cmds())          # backup first
+        kp = self.page("Keys")
+        kp.hold_ms.setValue(0)
+        self.done(kp.press(9))
+        self.assertIn((lc.KEY, struct.pack("<BH", 9, 0)), self.lc_meter.log)
+
+    def test_calibration_backup_restore(self):
+        cal = self.page("Calibration")
+        self.done(cal.calibrate(0))
+        self.assertIn("finish", cal.result.text())
+        self.assertIn((lc.CALIBRATE, struct.pack("<BH", 0, lc.CONFIRM_OK)), self.lc_meter.log)
+        bp = self.page("Backup")
+        self.done(bp.backup())
+        self.assertGreaterEqual(bp.files.count(), 1)
+        bp.files.setCurrentRow(0)
+        self.done(bp.compare())
+        self.assertIn("copy A: same as the meter", bp.result.text())
+        old_link = self.dev.link
+        self.done(bp.restore(), 20)
+        self.settle()
+        self.assertEqual(len(self.lc_meter.written_blocks), 1)
+        self.assertIsNot(self.win.active.link, old_link)          # followed the restart
+        self.assertTrue(self.win.active.link.is_open)
+        self.done(bp.recovery("settings_accept_a", "SETTINGS_ACCEPT_A", "x"))
+        self.assertIn(lc.SETTINGS_ACCEPT_A, self.lc_meter.cmds())
+
+    def test_slot_file_gets_the_foreign_warning(self):
+        # review_r1 findings 2 and 3: the releases publish no slot file, so the warning names what
+        # they list; refused: nothing is sent. Accepted: backup first, then the slot is written.
+        self.win.release_get = test_releases.FakeGitHub()
+        mp = self.page("Meter")
+        slot = os.path.join(self.tmp.name, "slot.bin")
+        with open(slot, "wb") as f:
+            f.write(fl.build_slot_file(lc.SLOT_BASE[1], version=3, length=0x400))
+        self.answers.append(None)
+        mp.start_boot_update(slot)
+        self.settle()
+        title, text = self.asked[-1]
+        self.assertEqual(title, "Slot file not from a release")
+        self.assertIn("APP_OWN.bin, APP_OWN.uf2, STARTER.bin", text)
+        self.assertIn("no release publishes a bootloader slot file", text)
+        self.assertNotIn(lc.BOOT_BEGIN, self.lc_meter.cmds())
+        mp.start_boot_update(slot)
+        self.settle(30)
+        self.assertIn("backup file first", self.asked[-1][1])
+        codes = self.lc_meter.cmds()
+        self.assertLess(codes.index(lc.CAL_READ), codes.index(lc.BOOT_BEGIN))
+        self.assertIn(lc.BOOT_INSTALL, codes)
+
+    def test_meter_screenshot_diagnostics(self):
+        mp = self.page("Meter")
+        self.done(mp.read_battery())
+        self.assertIn("3.90 V", mp.battery_label.text())
+        self.done(mp.read_info())
+        self.assertEqual(mp.info_labels["uid"].text(), LC_SERIAL)
+        self.done(mp.read_boot_status())
+        self.assertIn("free slot: A", mp.boot_text.text())
+        bad = os.path.join(self.tmp.name, "app.bin")
+        with open(bad, "wb") as f:
+            f.write(f2.build_app_image())
+        mp.start_update(bad, None)
+        self.assertIn("refused before anything was sent", mp.status.text())
+        self.assertNotIn(lc.UPDATE_MODE, self.lc_meter.cmds())
+        self.done(mp.reset())
+        self.assertEqual(self.lc_meter.restarts, 1)
+        self.done(mp.check_releases(False))
+        self.assertEqual(mp.release_combo.currentText(), "no releases published")
+        shot = self.page("Screenshot")
+        self.done(shot.capture(), 20)
+        self.assertEqual((shot.image.width(), shot.image.height()), (320, 240))
+        png = os.path.join(self.tmp.name, "s.png")
+        self.assertTrue(shot.save_png(png))
+        self.assertTrue(os.path.getsize(png) > 0)
+        dg = self.page("Diagnostics")
+        self.done(dg.ping())
+        self.assertIn("the same", dg.out.toPlainText())
+        dg.addr.setText("0x20000000")
+        dg.length.setValue(16)
+        self.done(dg.mem_read())
+        self.assertIn("20000000", dg.out.toPlainText())
+        self.done(dg.factory())
+        self.assertIn("FACTORY_MODE: 0", dg.out.toPlainText())
+        self.done(dg.measure())
+        self.assertIn("main: C 100.00 nF", dg.out.toPlainText())
+
+    def test_events_and_preferences(self):
+        self.win.active.link.event_frame.emit(
+            fl.Frame(1, 4, lc.EV_CALIBRATION, bytes([1, 2, 0]), 0.0))
+        self.assertTrue(wait(lambda: "status busy" in self.page("Calibration").progress.text()))
+        self.assertTrue(any("event CALIBRATION" in t for t in self.win.events.lines()))
+        pp = self.win.prefs
+        pp.csv.setCurrentIndex(1)
+        self.assertEqual(settings_mod.Settings(self.settings.path).get("csv_separator"), ";")
+        pp.theme.setCurrentIndex(2)
+        self.assertEqual(self.settings.get("theme"), "dark")
+
+
+# ----------------------------------------------------------------------------------------------
+class C2c53tPages(Bench):
+    def setUp(self):
+        super().setUp()
+        self.plug(C2_PORT)
+        self.assertTrue(self.connected("2C53T"))
+        self.dev = self.win.active.device
+
+    def test_multimeter_generator_and_the_live_reading(self):
+        mp = self.page("Multimeter")
+        self.done(mp._function(6))
+        self.assertIn((c2.DMM_FUNCTION, bytes([6])), self.c2_meter.log)
+        self.assertEqual(mp.function.currentText(), "C")
+        self.done(mp._toggle("DMM_HOLD", self.dev.dmm_hold, True, mp.hold))
+        self.assertTrue(mp.hold.isChecked())
+        gp = self.page("Generator")
+        gp.on.setChecked(True)
+        gp.frequency.setValue(2500)
+        self.win.publish_state(c2.parse_state(self.c2_meter.state()))
+        self.assertEqual(gp.frequency.value(), 2500)              # not overwritten while edited
+        self.assertIn("1000 Hz", gp.shown.text())                 # the meter's value shown
+        self.done(gp.apply())
+        self.assertEqual(self.c2_meter.state_kw["gen"], (1, 0, 2500, 50, 30))   # duty, amplitude
+                                                                               # as STATE had them
+        self.assertIn("2500 Hz", gp.shown.text())
+        self.c2_meter.pending.append((c2.STATE, self.c2_meter.state()))
+        self.done(self.page("Diagnostics").ping())
+        self.assertTrue(wait(lambda: self.win.live.stats.n >= 1))
+        self.assertEqual(self.win.live.big.text(), "4.70 kΩ")
+
+    def test_oscilloscope(self):
+        sp = self.page("Oscilloscope")
+        self.assertTrue(wait(lambda: sp.timebase.count() == 29))
+        self.c2_meter.state_kw["page"] = 2
+        self.done(self.page("Diagnostics").state())
+        self.win.tabs.setCurrentWidget(sp)
+        self.assertTrue(wait(lambda: sp.waves.get(0) is not None))
+        self.assertIn(c2.SCOPE_WAVE, self.c2_meter.cmds())
+        self.assertIn("trace age", sp.age.text())
+        self.done(sp._timebase(12))
+        self.assertEqual(sp.timebase.currentText(), "TB12")
+        sp.ch[1]["enabled"].setChecked(True)
+        self.done(sp.apply_channel(1))
+        self.assertEqual(self.c2_meter.state_kw["ch2"][0], 1)
+        sp.t_level.setValue(-30)
+        self.done(sp.apply_trigger())
+        self.assertEqual(self.c2_meter.state_kw["trigger"][2], -30)
+        for b in (sp.run_button, sp.stop_button, sp.autoset, sp.autocorrect):
+            b.click()
+        self.settle()
+        for code in (c2.SCOPE_RUN, c2.SCOPE_AUTOSET, c2.SCOPE_AUTOCORRECT):
+            self.assertIn(code, self.c2_meter.cmds())
+        self.win.tabs.setCurrentIndex(0)
+        self.settle()
+
+    def test_files(self):
+        fp = self.page("Files")
+        self.done(fp.list_dir())
+        self.assertEqual(sorted(e.name for e in fp.entries), ["BOOTINST.TXT", "README.TXT"])
+        dest = os.path.join(self.tmp.name, "readme.txt")
+        self.done(fp.read_to("2:/README.TXT", dest))
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"hello")
+        self.done(fp.write_from(dest, "2:/COPY.TXT"))
+        self.assertEqual(self.c2_meter.files["2:/COPY.TXT"], b"hello")
+        self.settle()
+        self.answers.append(None)                                 # overwrite refused
+        self.assertIsNone(fp.write_from(dest, "2:/README.TXT"))
+        self.assertIn("replaces 2:/README.TXT", self.asked[-1][1])
+        self.assertIsNone(fp.write_from(dest, "2:/update/app.bin"))
+        self.assertIn("start-up file", fp.status.text())
+        self.assertIsNone(fp.delete_path("2:/BOOTINST.TXT"))
+        self.done(fp.delete_path("2:/COPY.TXT"))
+        self.assertNotIn("2:/COPY.TXT", self.c2_meter.files)
+        self.answers.append(None)
+        self.assertIsNone(fp.share(True))
+        self.assertNotIn(c2.DRIVE, self.c2_meter.cmds())
+        self.assertIn("BOOTINST.TXT", self.asked[-1][1])
+
+    def test_end_sharing_asks_for_the_eject_and_checks_the_volume(self):
+        fp = self.page("Files")
+        self.volumes[:] = [Volume("/Volumes/2C53T", "2C53T", 0x2E3C, 0x2C53, True)]
+        self.done(fp.share(False))
+        self.assertIn("Eject the meter's drive", self.asked[-1][1])
+        self.assertNotIn(c2.DRIVE, self.c2_meter.cmds())
+        self.assertIn("still mounted at /Volumes/2C53T", fp.status.text())
+        self.answers.append(None)
+        self.assertIsNone(fp.share(False))                     # not confirmed
+        self.volumes[:] = [Volume("/dev/sdb", None, 0x2E3C, 0x2C53, False),     # unmounted node
+                           Volume("/Volumes/STICK", None, 0x0781, 0x5567, True)]  # another device
+        self.done(fp.share(False))
+        self.assertEqual(self.c2_meter.log[-1], (c2.DRIVE, b"\x00"))
+        self.assertIn("no volume of the meter was mounted", fp.status.text())
+
+    def test_settings_keys_diagnostics(self):
+        st = self.page("Settings")
+        self.assertTrue(wait(lambda: st.last is not None))
+        st.backlight.setValue(60)
+        self.done(st.apply())
+        self.assertEqual(self.c2_meter.settings[0], 60)
+        old = self.dev.link
+        self.done(st.save(), 20)
+        self.settle()
+        self.assertEqual(self.c2_meter.saved_settings[0], 60)
+        self.assertIsNot(self.win.active.link, old)              # reconnected after the restart
+        kp = self.page("Keys")
+        self.done(kp.press(15))
+        self.assertEqual(self.c2_meter.keys, [15])
+        self.answers.append(None)
+        self.assertIsNone(kp.press(1))
+        self.assertFalse(self.c2_meter.powered_off)
+        dg = self.page("Diagnostics")
+        self.done(dg.flash_id())
+        self.assertIn("0xEF", dg.out.toPlainText())
+        self.done(dg.fault())
+        self.assertIn("valid", dg.out.toPlainText())
+        self.done(dg.log_on())
+        self.done(dg.log_get())
+        self.assertIn("40 bytes", dg.out.toPlainText())
+        self.done(dg.cal_read())
+        self.assertIn("2048 bytes", dg.out.toPlainText())
+        self.done(dg.text_colour())
+        self.assertEqual(self.c2_meter.text_colour, 0)
+        self.done(dg.meter_send())
+        self.assertEqual(self.c2_meter.sent_to_chip, [(0, 0)])
+
+    def test_screenshot_dtr_and_releases(self):
+        shot = self.page("Screenshot")
+        self.done(shot.capture(), 20)
+        r, g, b = c2.rgb565_to_rgb([f2.pixel(200, 5)])
+        self.assertEqual(shot.image.pixel(200, 5) & 0xFFFFFF, r << 16 | g << 8 | b)
+        self.assertEqual((shot.image.width(), shot.image.height()), (320, 240))
+        self.win._show_stats()
+        self.assertIn("DTR set", self.win.dtr_label.text())
+        self.win.prefs.sleep.setChecked(True)                     # typed OK (default answer)
+        self.assertTrue(self.settings.get("let_2c53t_sleep"))
+        self.win.idle_limit = 0.0
+        self.win._idle_check()
+        link = self.win.active.link
+        self.assertTrue(wait(lambda: not link.dtr))
+        self.settle()
+        self.assertGreaterEqual(self.c2_meter.cmds().count(c2.CAL_READ), 16)   # backup first
+        self.win._show_stats()
+        self.assertIn("DTR clear", self.win.dtr_label.text())
+        self.win.user_action()
+        self.assertTrue(wait(lambda: link.dtr))
+        mp = self.page("Meter")
+        self.win.release_get = test_releases.FakeGitHub()
+        self.done(mp.check_releases(False))
+        self.assertEqual(mp.release_combo.itemText(0)[:7], "v1.4.17")
+        self.assertIn("same", mp.release_combo.itemText(0))
+        self.assertIn("none is newer than 1.4.17", mp.release_note.text())
+
+    def test_application_update_with_the_foreign_image_warning(self):
+        mp = self.page("Meter")
+        img = os.path.join(self.tmp.name, "APP_2C53T_V1.4.18_261120.bin")
+        with open(img, "wb") as f:
+            f.write(f2.build_app_image())
+        self.answers += [None]                                    # refuse the 13.26 warning
+        mp.start_update(img, None)
+        self.settle()
+        self.assertIn("not one of the published releases", self.asked[-1][1])
+        self.assertNotIn(c2.FW_BEGIN, self.c2_meter.cmds())
+        mp.start_update(img, None)                                # both answered OK now
+        self.settle(30)
+        self.assertEqual(self.c2_meter.installed, f2.build_app_image())
+        self.assertEqual(mp.info_labels["firmware"].text(), "1.4.18")
+        self.assertIn("1 (OK)", mp.info_labels["update"].text())
+        lc_file = os.path.join(self.tmp.name, "a.uf2")
+        with open(lc_file, "wb") as f:
+            f.write(fl.build_uf2())
+        mp.start_update(lc_file, None)
+        self.assertIn("UF2", mp.status.text())
+
+
+# ----------------------------------------------------------------------------------------------
+class UpdateDrive(Bench):
+    def test_2c53t_drive_after_a_failed_install(self):
+        drive = os.path.join(self.tmp.name, "IAP")
+        os.makedirs(drive)
+        info = DriveInfo("2C53T", drive, 0x2E3C, 0x5720, "failed")
+        self.watcher.drives_changed.emit([info])
+        self.assertTrue(wait(lambda: self.win.drive_page is not None))
+        dp = self.win.drive_page
+        self.assertFalse(dp.copy_button.isEnabled())             # 13.14: no 2C53T seen yet
+        self.assertIn("Refused", dp.reason.text())
+        self.plug(C2_PORT)                                        # the meter, slot bootloader v2
+        self.assertTrue(self.connected("2C53T"))
+        self.assertIn("still connected", self.win.c2_drive_owner()[1])
+        self.plug()                                               # its port goes: update mode
+        self.watcher.drives_changed.emit([info])
+        self.assertTrue(wait(lambda: self.win.drive_page is not None
+                             and self.win.drive_page.slot_meter is not None))
+        dp = self.win.drive_page
+        self.assertEqual(dp.slot_meter[:2], (C2_SERIAL, f2.INVENTED_UID.hex().upper()))
+        self.assertTrue(dp.copy_button.isEnabled())
+        img = os.path.join(self.tmp.name, "APP_2C53T_V1.4.18_261120.bin")
+        with open(img, "wb") as f:
+            f.write(f2.build_app_image())
+        dp.copy_path(img)
+        self.settle()
+        with open(os.path.join(drive, os.path.basename(img)), "rb") as f:
+            self.assertEqual(f.read(), f2.build_app_image())
+        self.assertIn("serial %s" % C2_SERIAL, self.asked[-1][1])
+
+    def test_2c53t_drive_refused_when_another_2c53t_came_after(self):
+        # review_r1 finding 8: the slot meter #1, then a 2C53T #2 (stock bootloader, never
+        # identified here) appears and goes: the drive may be #2's and is refused
+        drive = os.path.join(self.tmp.name, "IAP")
+        os.makedirs(drive)
+        self.plug(C2_PORT)
+        self.plug()
+        other = PortInfo("2C53T", "/dev/cu.fake-2c-2", "0A0B0C0D0E0F", 0x2E3C, 0x2C53)
+        self.denied.add(other.device)                             # never opened in this test
+        self.plug(other)
+        self.plug()
+        self.watcher.drives_changed.emit([DriveInfo("2C53T", drive, 0x2E3C, 0x5720, "ready")])
+        self.assertTrue(wait(lambda: self.win.drive_page is not None))
+        dp = self.win.drive_page
+        self.assertIsNone(dp.slot_meter)
+        self.assertFalse(dp.copy_button.isEnabled())
+        self.assertIn("0A0B0C0D0E0F", dp.reason.text())
+        dp.copy_path(os.path.join(self.tmp.name, "x.bin"))
+        self.assertEqual(os.listdir(drive), [])
+
+    def test_lc1020e_drive_refuses_a_2c53t_image(self):
+        drive = os.path.join(self.tmp.name, "LC1020E-IAP")
+        os.makedirs(drive)
+        self.watcher.drives_changed.emit([DriveInfo("LC1020E", drive, 0x19F5, 0x5740, "ready")])
+        self.assertTrue(wait(lambda: self.win.drive_page is not None))
+        img = os.path.join(self.tmp.name, "app.bin")
+        with open(img, "wb") as f:
+            f.write(f2.build_app_image())
+        self.win.drive_page.copy_path(img)
+        self.assertIn("refused", self.win.drive_page.status.text())
+        self.assertEqual(os.listdir(drive), [])
+        self.watcher.drives_changed.emit([])
+        self.assertTrue(wait(lambda: self.win.drive_page is None))
+
+
+if __name__ == "__main__":
+    unittest.main()

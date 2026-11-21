@@ -1,0 +1,7 @@
+# udev rule for the FNIRSI Companion: lets the logged-in user open the serial control channel of the meters and keeps
+# ModemManager from probing them.  2E3C:2C53 / 2E3C:5720: 2C53T (application / update drive); 19F5:1020 / 19F5:5740:
+# LC1020E.  Installed by the .deb to /usr/lib/udev/rules.d/; for the AppImage copy it there by hand (see README.md).
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e3c", ATTRS{idProduct}=="2c53", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e3c", ATTRS{idProduct}=="5720", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="19f5", ATTRS{idProduct}=="1020", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="19f5", ATTRS{idProduct}=="5740", ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess"
