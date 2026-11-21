@@ -12,3 +12,5 @@
 - Long jobs stop between two requests when cancelled (backups, screenshots, the 2C53T transfer before its install,
   the wait for the LC1020E update drive); saves, installs and copies always run to their end.
 - "End drive sharing" asks for the eject first and refuses while the meter's drive is still mounted.
+- Qt for Python 6.11.3: 6.12.0 on Linux with Python 3.11 loses a reference of True at every signal emit and stops
+  the program after a few hundred readings; tests/test_qt_binding.py checks every release for it.

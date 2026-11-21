@@ -65,6 +65,9 @@ class LcSettingsPage(Page):
         self.settings.clear()
         self.editors.clear()
         self.current.clear()
+        # the meter's own labels: setting 1 (volume) and setting 4 (warn sound) are both "Volume"
+        # (menu item and sorting-dialog row, PROTOCOL.md 8.2), so a repeated label gets its id
+        names = [st.name for _, st in items if not isinstance(st, Exception)]
         for r, (sid, st) in enumerate(items):
             if isinstance(st, Exception):
                 self.grid.addWidget(QLabel("setting %d" % sid), r, 0)
@@ -72,7 +75,8 @@ class LcSettingsPage(Page):
                                     r, 1)
                 continue
             self.settings[sid] = st
-            self.grid.addWidget(QLabel(st.name), r, 0)
+            self.grid.addWidget(QLabel(st.name if names.count(st.name) == 1
+                                       else "%s (setting %d)" % (st.name, sid)), r, 0)
             if st.kind == 0:
                 ed = QComboBox()
                 for i, text in enumerate(st.choices):

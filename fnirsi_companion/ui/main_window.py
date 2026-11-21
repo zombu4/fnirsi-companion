@@ -418,7 +418,10 @@ class MainWindow(QMainWindow):
         self.device_list.blockSignals(False)
         if self.active is not None:
             d = self.active.device
-            self.bar_status.setText("%s %s, UID %s" % (d.model, d.info.firmware, d.info.uid_hex))
+            # the firmware text of the LC1020E starts with the model ("LC1020E V1.1 OWN")
+            fw = d.info.firmware
+            self.bar_status.setText("%s, UID %s" % (fw if fw.startswith(d.model)
+                                                    else "%s %s" % (d.model, fw), d.info.uid_hex))
         elif self.connecting is not None:
             self.bar_status.setText("connecting to %s %s" % (self.connecting.model,
                                                              self.connecting.device))
