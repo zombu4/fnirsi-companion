@@ -40,5 +40,5 @@ Only the first time. This build is not signed with a paid Apple developer identi
 TXT
 fi
 rm -f "$out"
-hdiutil create -quiet -volname "FNIRSI Companion" -srcfolder "$stage" -ov -format UDZO "$out"
+hdiutil create -volname "FNIRSI Companion" -srcfolder "$stage" -ov -format UDZO "$out"
 echo "make_dmg: $out"
