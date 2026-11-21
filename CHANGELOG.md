@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-11-21
+
+Tested with the LC1020E on the meter (all pages). The 2C53T side is tested against the fake meter of the
+test suite only; its test on a meter follows.
 
 - First version of the FNIRSI Companion: one desktop program for the FNIRSI 2C53T and the LC1020E running the
   rewritten firmware, a native Qt window (no web server, no browser).
