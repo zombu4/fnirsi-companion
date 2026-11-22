@@ -7,6 +7,9 @@
   annunciators and keys, segmented controls, dark and light themes from one set of colours (the "system" theme follows
   the computer), the same Fusion style on macOS, Windows and Linux. The pages' commands, confirmations, backups and
   jobs are unchanged.
+- LC1020E: supports the INFO capability bit 21 "direct set" of the new firmware. With it set, SCREEN, LCR_SET, HOLD,
+  SETTINGS_SET and COMPARE_SET wait 4 s for the answer (23 s / 63 s on firmware without the bit), and SETTINGS_SET /
+  COMPARE_SET no longer switch the meter to the settings screen.
 
 ## 0.1.0 - 2026-11-21
 

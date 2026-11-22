@@ -68,6 +68,7 @@ T_FAST = 1.5
 T_SAVE = 4.0
 T_JOB = 23.0
 T_COMPARE_SET = 63.0
+T_DIRECT = 4.0                   # SL 4.3 / 14: the five set commands when CAP_DIRECT_SET is set
 T_CALIBRATE = 126.0
 T_BOOT_BEGIN = 13.0
 T_BOOT_INSTALL = 4.0
@@ -78,6 +79,7 @@ CAP_SETTINGS, CAP_CAL_READ, CAP_SCREENSHOT, CAP_MEM_READ, CAP_EVENTS, CAP_UPDATE
 CAP_BOOT, CAP_BATTERY, CAP_POWER_OFF, CAP_RESTORE_DEFAULTS, CAP_RECOVERY, CAP_FACTORY_MODE = \
     14, 15, 16, 17, 18, 19
 CAP_SETUP_LANGUAGE = 20          # clear in this firmware: English only (SL 5.6)
+CAP_DIRECT_SET = 21              # SL 4.3 / 14: the five set commands set the value directly, no key job
 
 STATUS_NAME = {0: "OK", 1: "unknown command", 2: "bad length or argument", 3: "not allowed now",
                4: "busy", 5: "storage error", 6: "refused for safety",
@@ -747,6 +749,9 @@ class LC1020E(Device):
         if code == KEY:                                   # SL 4.3: 23 s + the hold time
             hold = struct.unpack_from("<H", payload, 1)[0] if len(payload) >= 3 else 0
             return T_JOB + hold / 1000.0
+        if code in (SCREEN, LCR_SET, HOLD, SETTINGS_SET, COMPARE_SET) \
+                and self.info.has(CAP_DIRECT_SET):        # SL 4.3 / 14: direct set, no key job
+            return T_DIRECT
         return super().timeout_for(code, payload)
 
     # -- live ---------------------------------------------------------------------------------

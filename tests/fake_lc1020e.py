@@ -28,7 +28,8 @@ PortLost = base.PortLost
 
 INVENTED_UID = bytes.fromhex("A1B2C3D4E5F60718293A4B5C")
 OTHER_UID = bytes.fromhex("0F1E2D3C4B5A69788796A5B4")
-ALL_CAPS = 0x000FFFFF                       # SL 14: bits 0..19
+ALL_CAPS = 0x000FFFFF                       # SL 14: bits 0..19 (old firmware; the default)
+DIRECT_CAPS = 0x002FFFFF                    # SL 14: bits 0..19 and 21 (new firmware, direct set)
 
 
 def crc32(data: bytes) -> int:
@@ -155,6 +156,7 @@ class FakeMeter:
         self.uid, self.caps, self.text = uid, caps, text
         self.running_slot, self.slot_version = 1, 2
         self.update_result = 0
+        self.screen = 1                        # current screen (STATE, SCREEN, SETTINGS_SET)
         self.update_mode_status6 = False       # next slot below version 2 (UPDATE_MODE status 6)
         self.copies = [build_copy(5, 1), build_copy(4, 1)]      # A, B
         self.saves_held = False
@@ -222,13 +224,14 @@ class FakeMeter:
         return 0, bytes([self.factory])
 
     def _c_10(self, p):
-        return 0, build_state()
+        return 0, build_state(screen=self.screen)
 
     def _c_11(self, p):
         return 0, b""
 
     def _c_12(self, p):
-        return 0, build_state(screen=p[0])
+        self.screen = p[0]
+        return 0, build_state(screen=self.screen)
 
     def _c_13(self, p):
         return 0, build_state()
@@ -287,7 +290,11 @@ class FakeMeter:
         return 2, b""
 
     def _c_51(self, p):
-        return (0, build_state(screen=3)) if len(p) >= 3 else (2, b"")
+        if len(p) < 3:
+            return 2, b""
+        if not self.caps >> lc.CAP_DIRECT_SET & 1:            # old firmware: key job, ends on screen 3
+            self.screen = 3
+        return 0, build_state(screen=self.screen)             # direct set: the screen stays
 
     def _c_52(self, p):
         return self._save_answer() if self._confirmed(p) else (2, b"")

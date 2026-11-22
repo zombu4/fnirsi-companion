@@ -159,8 +159,13 @@ class SpecTable(unittest.TestCase):
         for n in ("INFO", "PING", "STATE", "MEASURE", "CAL_READ", "SCREENSHOT", "BOOT_DATA"):
             self.assertEqual(t[n], 1.5, n)
         for row in ("| every command not listed here | answered in the pass of the request | 1.5 s |",
-                    "| COMPARE_SET | job, 60 000 ms", "| CALIBRATE | job, 120 000 ms"):
+                    "| SCREEN, LCR_SET, HOLD, SETTINGS_SET, COMPARE_SET | direct (bit 21)",
+                    "4 s with bit 21 set; without it (older firmware: jobs of key presses) 23 s, "
+                    "COMPARE_SET 63 s |", "| CALIBRATE | job, 120 000 ms"):
             self.assertIn(row, self.text)
+        sec = self.text[self.text.index("## 14."):self.text.index("## 15.")]
+        self.assertIn("21 direct set", sec)              # lc.CAP_DIRECT_SET
+        self.assertEqual(lc.CAP_DIRECT_SET, 21)
 
 
 class Parsers(unittest.TestCase):
@@ -517,6 +522,47 @@ class RecordMethods(unittest.TestCase):
         b.meter._c_12 = lambda p: (0, b"\0\0")
         with self.assertRaises(base.DeviceError):
             b.dev.screen(1)
+
+
+class DirectSet(unittest.TestCase):
+    """CAP_DIRECT_SET (bit 21): answer limit of the five set commands and the screen after
+    SETTINGS_SET. Old firmware (bit clear) keeps 23 s / 63 s and screen 3."""
+    FIVE = (lc.SCREEN, lc.LCR_SET, lc.HOLD, lc.SETTINGS_SET, lc.COMPARE_SET)
+
+    def test_bit_and_limit_constants(self):
+        self.assertEqual(lc.CAP_DIRECT_SET, 21)
+        self.assertEqual(lc.T_DIRECT, 4.0)
+        self.assertEqual(fk.DIRECT_CAPS, 0x002FFFFF)
+        self.assertEqual(fk.ALL_CAPS, 0x000FFFFF)
+
+    def test_old_firmware_timeouts(self):
+        d = Bench(self).dev
+        self.assertFalse(d.info.has(lc.CAP_DIRECT_SET))
+        for code in self.FIVE:
+            want = lc.T_COMPARE_SET if code == lc.COMPARE_SET else lc.T_JOB
+            self.assertEqual(d.timeout_for(code, b"\0\0\0"), want, code)
+
+    def test_new_firmware_timeouts(self):
+        d = Bench(self, caps=fk.DIRECT_CAPS).dev
+        self.assertTrue(d.info.has(lc.CAP_DIRECT_SET))
+        for code in self.FIVE:
+            self.assertEqual(d.timeout_for(code, b"\0\0\0"), lc.T_DIRECT, code)
+        self.assertEqual(d.timeout_for(lc.KEY, struct.pack("<BH", 1, 500)), lc.T_JOB + 0.5)
+        self.assertEqual(d.timeout_for(lc.CALIBRATE), lc.T_CALIBRATE)
+        self.assertEqual(d.timeout_for(lc.SETTINGS_SAVE), lc.T_SAVE)
+        self.assertEqual(d.timeout_for(lc.STATE), lc.T_FAST)
+
+    def test_old_firmware_settings_set_goes_to_screen_3(self):
+        d = Bench(self).dev
+        self.assertEqual(d.screen(2).screen, 2)
+        self.assertEqual(d.settings_set(0, 60).screen, 3)
+
+    def test_new_firmware_screen_stays(self):
+        d = Bench(self, caps=fk.DIRECT_CAPS).dev
+        self.assertEqual(d.screen(2).screen, 2)
+        self.assertEqual(d.settings_set(0, 60).screen, 2)
+        d.compare_set(220.0, 2.5, 1, 1, 0)
+        self.assertEqual(d.read_state().screen, 2)
 
 
 class Confirmation(unittest.TestCase):
