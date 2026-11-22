@@ -131,7 +131,9 @@ class Dot(QWidget):
         p.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
 
 
-SECONDARY_LABEL = {"theta": "θ"}          # the LC1020E's secondary name "theta" as its sign
+# The LC1020E's secondary names as its manual writes them (5.2.7 "X/D/Q/θ/ESR"): the protocol's
+# "R" (secondary 0, the series resistance, NOTES "0 R/ESR") is ESR, "theta" is θ.
+SECONDARY_LABEL = {"R": "ESR", "theta": "θ"}
 TREND_WINDOW = 600.0                      # seconds of the Live page's trend card
 
 
@@ -409,7 +411,8 @@ class LivePage(Page):
             self.secondary.setText("")
         else:
             self.big.set_secondary(SECONDARY_LABEL.get(s.quantity, s.quantity), s.text)
-            self.secondary.setText("secondary %s %s" % (s.quantity, s.validity))
+            self.secondary.setText("secondary %s %s" % (SECONDARY_LABEL.get(s.quantity, s.quantity),
+                                                        s.validity))
         if reading.validity == "unknown":
             self.note_raw.setText("Raw meter data: the meter's record carries no unit prefix and "
                                   "no reading status (DESIGN 13.4); the value is the displayed "

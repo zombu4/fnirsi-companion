@@ -402,6 +402,11 @@ class Lc1020ePages(Bench):
         self.assertEqual(sorted(p.combos), [1, 2, 3])            # the fake answers lists 1..3
         self.assertEqual([p.combos[2].itemText(i) for i in range(2)], ["100Hz", "1kHz"])
         self.assertEqual(p.combos[2].currentText(), "1kHz")       # STATE frequency 1000
+        # the secondary list with the manual's names: the protocol's "R" is ESR, "theta" is θ
+        sec = [p.combos[1].itemText(i) for i in range(p.combos[1].count())]
+        self.assertNotIn("R", sec)
+        self.assertNotIn("theta", sec)
+        self.assertTrue({"ESR", "θ"} & set(sec) or sec == [], sec)
         self.done(p.set_value(2, 0))
         self.assertIn((lc.LCR_SET, bytes([2, 0])), self.lc_meter.log)
         self.assertEqual(p.combos[2].currentText(), "1kHz")       # the meter still answers 1000

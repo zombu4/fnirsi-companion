@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayo
 
 from ...devices import lc1020e as lc
 from ..base import Page, describe_error
+from ..common.data_pages import SECONDARY_LABEL
 from ..widgets import Card, Segmented, StatRow, label, set_kind
 
 # STATE field of each LCR_SET setting / LCR_TABLES list id (SL 5.3 table "Settings of LCR_SET")
@@ -126,7 +127,8 @@ class LcrPage(Page):
             combo = Segmented() if len(lst.entries) <= SEGMENTED_MAX else QComboBox()
             combo.setObjectName("lcr_%d" % lid)
             for v, text in lst.entries:
-                combo.addItem(text, v)
+                # list 1 is the secondary parameter (SL 8.1): shown with the manual's names
+                combo.addItem(SECONDARY_LABEL.get(text, text) if lid == 1 else text, v)
             combo.activated.connect(lambda idx, lid=lid: self.set_value(lid, idx))
             self.control(combo, lc.LCR_SET)
             self.grid.addWidget(combo, r, 1)

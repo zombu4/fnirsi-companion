@@ -978,7 +978,7 @@ class Lcd(QWidget):
             lc.setAlphaF(0.7)
             p.setPen(lc)
             p.drawText(QRectF(sx - 40, base - sub_h - 22, dw + uw2 + 40, 16),
-                       Qt.AlignRight | Qt.AlignVCenter, name.upper())
+                       Qt.AlignRight | Qt.AlignVCenter, name)   # as given: "θ", not "Θ"
             paint_segments(p, sx, base - sub_h, sub_h, d, self.sub_cells, seg, off, dark)
             if u:
                 p.setFont(sf2)
