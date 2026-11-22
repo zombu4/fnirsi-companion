@@ -68,8 +68,15 @@ class _Lost(Exception):
 
 
 def _pyserial(port: str):
+    """The port opened with pyserial. On macOS and Linux a port can be opened by several programs
+    at once (measured 2026-11-21: a second program opened the LC1020E's port while the companion
+    had it, and both read the meter's frames); exclusive=True (TIOCEXCL plus flock) refuses a
+    second exclusive opener, so two companions never share a meter. Windows opens a COM port for
+    one program only by itself; pyserial takes the parameter on POSIX only."""
+    import os
     import serial
-    return serial.Serial(port, BAUD, timeout=READ_TIMEOUT, write_timeout=WRITE_TIMEOUT)
+    extra = {"exclusive": True} if os.name == "posix" else {}
+    return serial.Serial(port, BAUD, timeout=READ_TIMEOUT, write_timeout=WRITE_TIMEOUT, **extra)
 
 
 class _Job:
