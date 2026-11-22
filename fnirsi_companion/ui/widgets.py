@@ -438,20 +438,30 @@ class KeyButton(QAbstractButton):
         p.setBrush(t["panel-2"])
         p.drawRoundedRect(r, 10, 10)
         p.setPen(t["ink"] if en else t["ink-3"])
-        f = style.sans(13, QFont.Weight.DemiBold)
+        room = int(r.width()) - 8
+        f, text = self._fit(self.text(), (13, 12, 11, 10), QFont.Weight.DemiBold, room)
         p.setFont(f)
-        text = QFontMetrics(f).elidedText(self.text(), Qt.ElideRight, int(r.width()) - 8)
         if self.sub:
             top = QRectF(r.x(), r.y() + 5, r.width(), r.height() / 2)
             p.drawText(top, Qt.AlignHCenter | Qt.AlignVCenter, text)
-            p.setFont(style.sans(10))
+            sf, sub = self._fit(self.sub, (10, 9, 8), QFont.Weight.Normal, room)
+            p.setFont(sf)
             p.setPen(t["ink-3"])
-            fm = QFontMetrics(style.sans(10))
-            sub = fm.elidedText(self.sub, Qt.ElideRight, int(r.width()) - 8)
             p.drawText(QRectF(r.x(), r.center().y() + 1, r.width(), r.height() / 2 - 5),
                        Qt.AlignHCenter | Qt.AlignVCenter, sub)
         else:
             p.drawText(r, Qt.AlignCenter, text)
+
+    @staticmethod
+    def _fit(text: str, sizes, weight, room: int):
+        """The largest of `sizes` (px) at which `text` fits into `room` pixels; at the smallest
+        size a text that still does not fit is cut with "…" (the tooltip has it in full)."""
+        for px in sizes:
+            f = style.sans(px, weight)
+            fm = QFontMetrics(f)
+            if fm.horizontalAdvance(text) <= room:
+                return f, text
+        return f, fm.elidedText(text, Qt.ElideRight, room)
 
 
 class KeyRow(QWidget):

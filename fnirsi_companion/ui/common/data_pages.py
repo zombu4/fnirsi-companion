@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QDesktopServices, QPainter
+from PySide6.QtGui import QDesktopServices, QPainter, QValidator
 from PySide6.QtWidgets import (QDoubleSpinBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QPushButton, QSizePolicy, QSpinBox, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
@@ -56,6 +56,38 @@ def fmt_si(v, unit: str, digits: int = 5) -> str:
                 scale, p = 1.0, ""
             return "%.*g %s%s" % (digits, v / scale, p, unit)
     return "%g %s" % (v, unit)
+
+
+class ScaleBox(QDoubleSpinBox):
+    """A limit of the fixed vertical scale in the SI unit of the reading. Shows the shortest
+    form of the number ("0", "1.5e-07") instead of a fixed count of decimals, and takes any
+    number Python's float() reads; keeps 15 decimals so that pF and nH values are not rounded."""
+
+    def __init__(self, value: float):
+        super().__init__()
+        self.setRange(-1e12, 1e12)
+        self.setDecimals(15)
+        self.setValue(value)
+
+    def textFromValue(self, v: float) -> str:
+        return "%.6g" % v
+
+    def valueFromText(self, text: str) -> float:
+        try:
+            return float(text)
+        except ValueError:
+            return self.value()
+
+    def validate(self, text: str, pos: int):
+        t = text.strip()
+        try:
+            float(t)
+            return QValidator.State.Acceptable, text, pos
+        except ValueError:
+            pass
+        if all(c in "0123456789+-.eE" for c in t):
+            return QValidator.State.Intermediate, text, pos
+        return QValidator.State.Invalid, text, pos
 
 
 # ----------------------------------------------------------------------------------------------
@@ -521,12 +553,9 @@ class TrendPage(Page):
         self.span.currentIndexChanged.connect(lambda _i: self.redraw(force=True))
         self.auto = Segmented(["Auto", "Fixed"])
         self.auto.currentIndexChanged.connect(self._scale)
-        self.ymin = QDoubleSpinBox()
-        self.ymax = QDoubleSpinBox()
-        for sb, v in ((self.ymin, 0.0), (self.ymax, 1.0)):
-            sb.setRange(-1e12, 1e12)
-            sb.setDecimals(9)
-            sb.setValue(v)
+        self.ymin = ScaleBox(0.0)
+        self.ymax = ScaleBox(1.0)
+        for sb in (self.ymin, self.ymax):
             sb.setFixedWidth(130)
             sb.valueChanged.connect(self._scale)
         self.cursors = QPushButton("Cursors")

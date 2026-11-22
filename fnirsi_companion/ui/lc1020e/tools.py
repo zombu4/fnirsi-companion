@@ -42,11 +42,11 @@ KEYS = {
 
 # The Live page's key row (DESIGN_UI 6.10): the keys whose measure-screen meaning above has a
 # short-press part, labelled with the words of that meaning; the second line is its long-press
-# part. Keys 0 and 3 act on the measure screen only when held, so they are on the Keys card only.
+# part in short (the tooltip has the full meaning from KEYS). Keys 0 and 3 act on the measure screen only when held, so they are on the Keys card only.
 LIVE_KEYS = {
     9: ("Func +1", ""), 6: ("secondary +1", ""), 13: ("FREQ", ""), 11: ("AMP", ""),
-    8: ("BIAS", ""), 7: ("RANGE", ""), 12: ("speed +1", "long: circuit mode +1"),
-    10: ("hold", "long: compare screen"), 2: ("cursor +1", ""), 4: ("cursor -1", ""),
+    8: ("BIAS", ""), 7: ("RANGE", ""), 12: ("speed +1", "long: circuit"),
+    10: ("hold", "long: compare"), 2: ("cursor +1", ""), 4: ("cursor -1", ""),
     1: ("value +1", ""), 5: ("value -1", ""),
 }
 

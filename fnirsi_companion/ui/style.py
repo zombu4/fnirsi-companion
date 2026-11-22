@@ -21,7 +21,8 @@ import tempfile
 import weakref
 
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPalette, QPen
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QGuiApplication, QImage, QPainter,
+                           QPalette, QPen)
 from PySide6.QtWidgets import QApplication
 
 # ----------------------------------------------------------------------------------------------
@@ -67,6 +68,17 @@ LIGHT = {
 
 THEMES = {"dark": DARK, "light": LIGHT}
 MONO_FAMILIES = ["SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono"]
+_mono_installed: list = []
+
+
+def mono_families() -> list:
+    """MONO_FAMILIES that this computer has, in their order (asking Qt for a family it does not
+    have makes it build its whole alias table, about 60 ms, and log a warning; "SF Mono" is not an
+    installed family on every macOS). Falls back to the full list when none is installed."""
+    if not _mono_installed:
+        have = set(QFontDatabase.families())
+        _mono_installed.extend([f for f in MONO_FAMILIES if f in have] or MONO_FAMILIES)
+    return _mono_installed
 
 _state = {"name": "dark"}
 _plots: "weakref.WeakSet" = weakref.WeakSet()
@@ -104,7 +116,7 @@ def qss(c: QColor) -> str:
 def mono(px: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
     """The mono font (values, versions, counters) at px pixels."""
     f = QFont()
-    f.setFamilies(MONO_FAMILIES)
+    f.setFamilies(mono_families())
     f.setStyleHint(QFont.StyleHint.Monospace)
     f.setPixelSize(px)
     f.setWeight(weight)
@@ -172,7 +184,7 @@ def stylesheet(t: dict, theme: str = "dark") -> str:
     """The application style sheet built from the token dict t."""
     c = {k: qss(v) for k, v in t.items()}
     c.update({"icon-" + k: v for k, v in icon_files(t, theme).items()})
-    mono_family = ", ".join('"%s"' % f for f in MONO_FAMILIES)
+    mono_family = ", ".join('"%s"' % f for f in mono_families())
     return """
 QWidget { color: %(ink)s; font-size: 13px; }
 QMainWindow, QDialog, QMessageBox { background: %(body)s; }

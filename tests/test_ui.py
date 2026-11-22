@@ -773,6 +773,26 @@ class Look(Bench):
     """DESIGN_UI 6.16: every sidebar view of each model in both themes at 1100 x 720, the theme
     switch, the seven-segment characters, and the LCD's annunciators from the meter's records."""
 
+    def test_scale_box_short_numbers_and_small_values(self):
+        from PySide6.QtGui import QValidator
+        from fnirsi_companion.ui.common.data_pages import ScaleBox
+        sb = ScaleBox(0.0)
+        self.assertEqual(sb.text(), "0")
+        sb.setValue(1.5e-7)
+        self.assertEqual(sb.text(), "1.5e-07")
+        sb.setValue(2.2e-12)                       # a pF value is kept, not rounded to 0
+        self.assertEqual(sb.value(), 2.2e-12)
+        self.assertEqual(sb.valueFromText("4.7e3"), 4700.0)
+        self.assertEqual(sb.validate("1e", 2)[0], QValidator.State.Intermediate)
+        self.assertEqual(sb.validate("abc", 3)[0], QValidator.State.Invalid)
+
+    def test_mono_families_are_installed_ones(self):
+        from PySide6.QtGui import QFontDatabase
+        have = set(QFontDatabase.families())
+        fams = style.mono_families()
+        self.assertTrue(fams)
+        self.assertTrue(all(f in have for f in fams) or fams == style.MONO_FAMILIES)
+
     def show_every_view(self):
         shown = []
         for theme in ("dark", "light"):
