@@ -4,12 +4,15 @@ command tables parsed from PROTOCOL.md of fnirsi-lc1020e-firmware-rewrite (sibli
 the file named by the environment variable FNIRSI_LC1020E_PROTOCOL)."""
 
 import json
+import math
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -116,7 +119,8 @@ class SpecTable(unittest.TestCase):
             self.assertEqual(lc.COMMANDS[code].name, name)
 
     def test_table_has_no_command_the_spec_lacks(self):
-        self.assertEqual(sorted(lc.COMMANDS), sorted(self.spec))
+        # PROTOCOL.md does not carry the own calibration area (OCD section 4) yet: 0x30 .. 0x37
+        self.assertEqual(sorted(lc.COMMANDS), sorted(set(self.spec) | set(lc.OCAL_COMMANDS)))
 
     def test_capability_bits_section_14(self):
         sec = self.text[self.text.index("## 14."):self.text.index("## 15.")]
@@ -132,7 +136,9 @@ class SpecTable(unittest.TestCase):
             15: ["BATTERY"], 16: ["POWER_OFF"], 17: ["RESTORE_DEFAULTS"],
             18: ["SETTINGS_RESTORE_B", "SETTINGS_ACCEPT_A", "SETTINGS_ACCEPT_B",
                  "SETTINGS_ACCEPT_DEFAULTS", "SETTINGS_WRITE_BLOCK"],
-            19: ["FACTORY_MODE"], 20: ["SETUP_LANGUAGE"],
+            19: ["FACTORY_MODE"], 20: ["SETUP_LANGUAGE"], 23: ["TOLERANCE_SET"],
+            26: ["OCAL_INFO", "OCAL_READ", "OCAL_WRITE", "OCAL_ROLLBACK", "OCAL_LOCK", "OCAL_RAW",
+                 "OCAL_TRACE", "MONITOR"],
         }
         by_name = {c.name: c for c in lc.COMMANDS.values()}
         seen = set()
@@ -161,7 +167,9 @@ class SpecTable(unittest.TestCase):
         for row in ("| every command not listed here | answered in the pass of the request | 1.5 s |",
                     "| SCREEN, LCR_SET, HOLD, SETTINGS_SET, COMPARE_SET | direct (bit 21)",
                     "4 s with bit 21 set; without it (older firmware: jobs of key presses) 23 s, "
-                    "COMPARE_SET 63 s |", "| CALIBRATE | job, 120 000 ms"):
+                    "COMPARE_SET 63 s |",
+                    "| CALIBRATE | job, 360 000 ms with capability bit 25",
+                    "120 000 ms without it | 366 s with bit 25, 126 s without it |"):
             self.assertIn(row, self.text)
         sec = self.text[self.text.index("## 14."):self.text.index("## 15.")]
         self.assertIn("21 direct set", sec)              # lc.CAP_DIRECT_SET
@@ -460,7 +468,7 @@ class CallAndCapability(unittest.TestCase):
             b.dev.call(0x7F)
 
     def test_dangerous_refused_by_generic_call(self):
-        b = Bench(self)
+        b = Bench(self, caps=fk.OCAL_CAPS)
         for code, c in lc.COMMANDS.items():
             if c.dangerous:
                 with self.assertRaises(base.SafetyRefused, msg=c.name):
@@ -552,6 +560,27 @@ class DirectSet(unittest.TestCase):
         self.assertEqual(d.timeout_for(lc.SETTINGS_SAVE), lc.T_SAVE)
         self.assertEqual(d.timeout_for(lc.STATE), lc.T_FAST)
 
+    def test_calibration_sweep_bit_25(self):
+        # SL 4.3 / 5.3.3 / 14: bit 25 -> CALIBRATE waits 366 s, answers 8 bytes, step counts windows
+        self.assertEqual(lc.CAP_CAL_SWEEP, 25)
+        self.assertEqual(Bench(self, caps=fk.NEW_CAPS | 1 << 25).dev.timeout_for(lc.CALIBRATE),
+                         lc.T_CALIBRATE_SWEEP)
+        self.assertEqual(lc.T_CALIBRATE_SWEEP, 366.0)
+        self.assertEqual(Bench(self, caps=fk.NEW_CAPS).dev.timeout_for(lc.CALIBRATE), lc.T_CALIBRATE)
+        c = lc.parse_cal_answer(3, struct.pack("<BBIBB", 3, 11, 0, 4, 3))
+        self.assertEqual((c.cal_status, c.cal_type, c.point, c.reason), (3, 11, 4, 3))
+        self.assertIn("ended at point 5/15: an open point below 100 kohm", c.describe())
+        ok = lc.parse_cal_answer(0, struct.pack("<BBIBB", 2, 0, 0, 0xFF, 0))
+        self.assertNotIn("ended at", ok.describe())
+        old = lc.parse_cal_answer(0, struct.pack("<BBI", 2, 0, 0))
+        self.assertIsNone(old.point)
+        self.assertEqual(lc.cal_progress({"status": 1, "step": 7, "type": 11}, True),
+                         "status busy, point 3/15, 1 of 3 windows, type 11")
+        self.assertEqual(lc.cal_progress({"status": 1, "step": 45, "type": 11}, True),
+                         "status busy, storing, type 11")
+        self.assertEqual(lc.cal_progress({"status": 1, "step": 7, "type": 11}, False),
+                         "status busy, step 7 s, type 11")
+
     def test_old_firmware_settings_set_goes_to_screen_3(self):
         d = Bench(self).dev
         self.assertEqual(d.screen(2).screen, 2)
@@ -563,6 +592,168 @@ class DirectSet(unittest.TestCase):
         self.assertEqual(d.settings_set(0, 60).screen, 2)
         d.compare_set(220.0, 2.5, 1, 1, 0)
         self.assertEqual(d.read_state().screen, 2)
+
+
+class NewFirmwareFeatures(unittest.TestCase):
+    """Capability bits 22 (60 Hz), 23 (tolerance modes), 24 (MEASURE markers, save result 9);
+    older firmware (records of 64 and 29 bytes) keeps working."""
+
+    def test_bits_and_caps_word(self):
+        self.assertEqual((lc.CAP_FREQ_60HZ, lc.CAP_TOLERANCE, lc.CAP_MEASURE_MARKER), (22, 23, 24))
+        self.assertEqual(fk.NEW_CAPS, 0x01EFFFFF)
+        self.assertEqual(lc.COMMANDS[lc.TOLERANCE_SET].cap_bit, lc.CAP_TOLERANCE)
+        self.assertEqual(lc.TOLERANCE_SET, 0x28)
+        self.assertEqual(lc.COMMANDS[lc.TOLERANCE_SET].timeout, lc.T_FAST)
+        d = Bench(self, caps=fk.NEW_CAPS).dev
+        self.assertEqual(d.timeout_for(lc.TOLERANCE_SET), lc.T_FAST)
+
+    def test_measure_65_and_64_bytes(self):
+        m = lc.parse_measure(fk.build_measure(markers=0x02))
+        self.assertEqual((len(m.raw), m.markers, m.secondary_unspecified), (65, 2, True))
+        self.assertFalse(lc.parse_measure(fk.build_measure(markers=0x01)).secondary_unspecified)
+        old = lc.parse_measure(fk.build_measure())
+        self.assertEqual((len(old.raw), old.markers, old.secondary_unspecified), (64, 0, False))
+        with self.assertRaises(base.DeviceError):
+            lc.parse_measure(fk.build_measure()[:63])
+
+    def test_signed_and_overload_texts_and_marker_reading(self):
+        neg = fk.build_value(-1.0036, 1, 4, 0, "-1.0036")
+        m = lc.parse_measure(fk.build_measure(secondary_kind=0, secondary=neg, markers=2))
+        r = lc.measure_to_reading(m, 1.0, 2.0)
+        self.assertEqual(r.secondary.text, "-1.0036 Ω")
+        self.assertAlmostEqual(r.secondary.value, -1.0036, 4)
+        self.assertTrue(r.secondary.unspecified)
+        self.assertFalse(r.unspecified)
+        r1 = lc.measure_to_reading(lc.parse_measure(fk.build_measure(markers=1)), 1.0, 2.0)
+        self.assertTrue(r1.unspecified)                  # bit 0: the main value
+        self.assertFalse(r1.secondary.unspecified)
+        ol = fk.build_value(0.0, 3, 0, 1, "0L  ")
+        m = lc.parse_measure(fk.build_measure(main_row=1, main=ol))
+        r = lc.measure_to_reading(m, 1.0, 2.0)
+        self.assertEqual((r.validity, r.value, r.text), ("overload", None, "0L  "))
+        self.assertFalse(r.secondary.unspecified)
+
+    def test_measure_over_the_link(self):
+        b = Bench(self, caps=fk.NEW_CAPS)
+        b.meter.measure_markers = 2
+        self.assertTrue(b.dev.measure_reading().secondary.unspecified)
+        self.assertEqual(len(b.dev.measure().raw), 65)
+        b.meter.old_records = True
+        self.assertEqual(len(b.dev.measure().raw), 64)
+        self.assertFalse(b.dev.measure_reading().secondary.unspecified)
+
+    def test_compare_50_and_29_bytes(self):
+        tail = dict(mode_in_force=2, mode_set=3, letter="J", lower=-0.25, upper=0.5, result=3,
+                    signed_deviation=-0.4, secondary_kind=3, secondary_value=1.5)
+        c = lc.parse_compare(fk.build_compare(tail=tail))
+        self.assertEqual(len(c.raw), 50)
+        self.assertEqual((c.mode_in_force, c.mode_set, c.letter, c.result, c.secondary_kind),
+                         (2, 3, "J", 3, 3))
+        self.assertEqual(c.result_name, "LO")
+        self.assertAlmostEqual(c.lower, -0.25)
+        self.assertAlmostEqual(c.upper, 0.5)
+        self.assertAlmostEqual(c.signed_deviation, -0.4, 5)
+        self.assertAlmostEqual(c.secondary_value, 1.5)
+        self.assertEqual(c.passed, 3)                                  # the old fields are unchanged
+        old = lc.parse_compare(fk.build_compare())
+        self.assertEqual(len(old.raw), 29)
+        for f in ("mode_in_force", "mode_set", "letter", "lower", "upper", "result",
+                  "signed_deviation", "secondary_kind", "secondary_value", "result_name"):
+            self.assertIsNone(getattr(old, f), f)
+        for res, name in ((0, "---"), (1, "IN"), (2, "HI"), (3, "LO"), (5, "OUT of range"),
+                          (6, "---")):
+            t = dict(tail, result=res, letter="")
+            self.assertEqual(lc.parse_compare(fk.build_compare(tail=t)).result_name, name)
+        with self.assertRaises(base.DeviceError):
+            lc.parse_compare(fk.build_compare()[:28])
+
+    def test_compare_over_the_link(self):
+        d = Bench(self, caps=fk.NEW_CAPS).dev
+        c = d.compare()
+        self.assertEqual((len(c.raw), c.ok, c.result), (50, 1, 1))
+        old = Bench(self).dev.compare()
+        self.assertEqual(len(old.raw), 29)
+
+    def test_tolerance_set_encoding(self):
+        b = Bench(self, caps=fk.NEW_CAPS)
+        c = b.dev.tolerance_set(1, -250, 500, secondary_kind=1, secondary_value=0.05)
+        self.assertEqual(b.sent(lc.TOLERANCE_SET)[0][1],
+                         struct.pack("<BiiBBf", 1, -250, 500, 0, 1, 0.05))
+        self.assertEqual(len(b.sent(lc.TOLERANCE_SET)[0][1]), 15)
+        self.assertEqual((c.mode_set, c.mode_in_force, c.result_name), (1, 1, "IN"))
+        self.assertAlmostEqual(c.lower, -2.5)
+        self.assertAlmostEqual(c.upper, 5.0)
+        self.assertEqual(c.secondary_kind, 1)
+        c = b.dev.tolerance_set(3, letter="B", secondary_kind=2, secondary_value=100.0)
+        self.assertEqual(b.sent(lc.TOLERANCE_SET)[1][1],
+                         struct.pack("<BiiBBf", 3, 0, 0, ord("B"), 2, 100.0))
+        self.assertEqual((c.mode_set, c.letter, c.result_name), (3, "B", "HI"))
+        c = b.dev.tolerance_set(2, -100, 100)
+        self.assertEqual((c.mode_in_force, c.mode_set), (2, 2))
+        c = b.dev.tolerance_set(0)
+        self.assertEqual((c.mode_in_force, c.mode_set), (0, 0))
+
+    def test_compare_set_returns_the_mode_to_0(self):
+        b = Bench(self, caps=fk.NEW_CAPS)
+        b.dev.tolerance_set(3, letter="K")
+        self.assertEqual(b.dev.compare().mode_set, 3)
+        c = b.dev.compare_set(220.0, 2.5, 1, 1, 0)
+        self.assertEqual((c.mode_set, c.mode_in_force, c.letter), (0, 0, ""))
+
+    def test_tolerance_set_validation_on_the_host(self):
+        b = Bench(self, caps=fk.NEW_CAPS)
+        bad = [dict(mode=4), dict(mode=1, lower=-10000, upper=0), dict(mode=1, lower=0, upper=99991),
+               dict(mode=1, lower=5, upper=4), dict(mode=2, lower=-100000, upper=0),
+               dict(mode=2, lower=0, upper=100000), dict(mode=3, letter="A"),
+               dict(mode=3, letter=""), dict(mode=3, letter="BC"), dict(mode=0, secondary_kind=4),
+               dict(mode=0, secondary_value=-1.0), dict(mode=0, secondary_value=float("nan")),
+               dict(mode=0, secondary_value=float("inf"))]
+        for kw in bad:
+            with self.assertRaises(ValueError, msg=str(kw)):
+                b.dev.tolerance_set(**kw)
+        self.assertEqual(b.sent(lc.TOLERANCE_SET), [])
+        for ch in lc.TOL_LETTERS:
+            b.dev.tolerance_set(3, letter=ch)
+        b.dev.tolerance_set(1, -9999, 99990)
+        b.dev.tolerance_set(2, -99999, 99999)
+        self.assertEqual(len(b.sent(lc.TOLERANCE_SET)), 11)
+
+    def test_tolerance_set_meter_statuses(self):
+        b = Bench(self, caps=fk.NEW_CAPS)
+        b.meter.compare_quantity = 1                          # R: pF limits are not allowed
+        with self.assertRaises(base.StatusError) as cm:
+            b.dev.tolerance_set(2, -100, 100)
+        self.assertEqual(cm.exception.status, 3)
+        self.assertEqual(cm.exception.record.mode_set, 0)    # the record comes with the status
+        with self.assertRaises(base.StatusError) as cm:       # the meter's own check (status 2)
+            b.dev.call(lc.TOLERANCE_SET, b"\0" * 14)
+        self.assertEqual(cm.exception.status, 2)
+
+    def test_tolerance_set_needs_bit_23(self):
+        b = Bench(self)
+        with self.assertRaises(base.CapabilityError):
+            b.dev.tolerance_set(0)
+        self.assertEqual(b.sent(lc.TOLERANCE_SET), [])
+
+    def test_save_result_9(self):
+        self.assertEqual(lc.SAVE_RESULT[9],
+                         "unchanged: both copies already held the block, nothing written")
+        b = Bench(self, caps=fk.NEW_CAPS)
+        b.meter.unchanged_saves = True
+        r = b.dev.settings_save("OK")
+        self.assertEqual((r.status, r.result, r.restart), (0, lc.SAVE_UNCHANGED, False))
+        self.assertIn("unchanged", r.describe())
+        ev = lc.parse_event(lc.EV_SAVE_RESULT, struct.pack("<II", 9, 0))
+        self.assertEqual(ev.fields["save_status"] & 0xFF, lc.SAVE_UNCHANGED)
+
+    def test_60hz_in_the_frequency_list(self):
+        old = Bench(self).dev.lcr_tables(2)
+        self.assertEqual(len(old.entries), 2)
+        d = Bench(self, caps=fk.NEW_CAPS).dev
+        fq = d.lcr_tables(2)
+        self.assertEqual((fq.entries[5], len(fq.entries)), ((60, "60Hz"), 6))
+        self.assertEqual(fq.entries[1], (1000, "1kHz"))
+        self.assertEqual(d.lcr_set(2, 5).main_row, 2)
 
 
 class Confirmation(unittest.TestCase):
@@ -1334,6 +1525,874 @@ class SerialLevelFake(unittest.TestCase):
         ser.write(fr.encode(3, fr.REQUEST, 0x7F))
         bad = fr.FrameParser().feed(ser.read(ser.in_waiting), 0.0)[0]
         self.assertEqual(bad.payload[0], 1)
+
+
+# ----------------------------------------------------------------------------------------------
+# The own calibration area (OWN_CAL_DESIGN.md "OCD"): bodies, records, the OCAL_* commands
+# ----------------------------------------------------------------------------------------------
+
+UID_HEX = fk.INVENTED_UID.hex().upper()
+
+
+def meta_body(note="first") -> bytes:
+    """The smallest body: META only, 4 + 32 = 36 bytes."""
+    return lc.build_body({lc.SEC_META: lc.pack_meta(1700000000, note)})
+
+
+def default_gain() -> bytes:
+    return lc.pack_gain([lc.GainFreq() for _ in range(6)])
+
+
+class OcalBodies(unittest.TestCase):
+    def test_section_sizes_and_the_record_size(self):
+        # OCD 1.2: META 32, GAIN 6 x 332 = 1992, CLIP 64, SETTLE 84, MONITOR 28, BIAS 4;
+        # (4+32) + (4+1992) + (4+64) + (4+84) + (4+28) + (4+4) = 2228, plus the 0x40 header = 0x8F4
+        parts = {lc.SEC_META: lc.pack_meta(1, "x"), lc.SEC_GAIN: default_gain(),
+                 lc.SEC_CLIP: lc.pack_clip([(0, 4095)] * 16),
+                 lc.SEC_SETTLE: lc.pack_settle([list(lc.DEFAULT_SETTLE_MS[k:k + 1]) * 6
+                                                for k in range(7)]),
+                 lc.SEC_MONITOR: lc.pack_monitor(0, [0.0] * 6), lc.SEC_BIAS: lc.pack_bias(100)}
+        self.assertEqual([len(parts[i]) for i in range(6)], [32, 1992, 64, 84, 28, 4])
+        body = lc.build_body(parts)
+        self.assertEqual(len(body), 2228)
+        self.assertEqual(0x40 + len(body), 0x8F4)
+        self.assertEqual(lc.parse_body(body), parts)
+
+    def test_gain_entry_layout(self):
+        g = lc.GainFreq(zeta_mag_mask=0x11, zeta_phase_mask=0x22, nu_mag_mask=3, nu_phase_mask=5)
+        g.zeta[1] = complex(1.5, -0.5)
+        g.nu[7] = complex(0.75, 0.25)
+        d = lc.pack_gain_freq(g)
+        self.assertEqual(len(d), 332)
+        self.assertEqual(struct.unpack_from("<IIBBH", d), (0x11, 0x22, 3, 5, 0))
+        self.assertEqual(struct.unpack_from("<ff", d, 12 + 8), (1.5, -0.5))         # zeta[1]
+        self.assertEqual(struct.unpack_from("<ff", d, 12 + 256 + 7 * 8), (0.75, 0.25))   # nu[7]
+        self.assertEqual(lc.unpack_gain_freq(d), g)
+        self.assertTrue(lc.GainFreq(1 << 9, 1 << 9, 1 << 3, 1 << 3).cell_calibrated(3, 1, 1))  # k = 8*1+1
+        self.assertFalse(lc.GainFreq(1 << 9, 1 << 9, 1 << 3, 0).cell_calibrated(3, 1, 1))
+
+    def test_gain_factor_bounds(self):
+        # 0.25 <= re^2 + im^2 <= 4, re > 0 and 4 re^2 >= re^2 + im^2 (arg <= 60 degrees)
+        ok = [1 + 0j, 1.9 + 0j, 0.6 + 1.0j, 0.5 + 0j]       # |z|^2 = 1, 3.61, 1.36 (4*0.36 = 1.44), 0.25
+        bad = [0.4 + 0j, 2.1 + 0j, 0.5 + 0.9j, -1 + 0j, complex(math.nan, 0), complex(math.inf, 0)]
+        for z in ok:
+            self.assertIsNone(lc.check_gain_factor(z), z)
+        for z in bad:                                       # 0.16, 4.41, 4*0.25 = 1.0 < 1.06, re < 0, nan, inf
+            self.assertIsNotNone(lc.check_gain_factor(z), z)
+
+    def test_gain_entry_index_and_unused_values(self):
+        entries = [lc.GainFreq() for _ in range(6)]
+        entries[2].zeta[5] = 0.4 + 0j
+        lc.validate_section(lc.SEC_GAIN, lc.pack_gain(entries))      # no mask bit: not checked
+        entries[2].zeta_mag_mask = 1 << 5
+        with self.assertRaises(lc.OcalValidationError) as c:
+            lc.validate_section(lc.SEC_GAIN, lc.pack_gain(entries))
+        self.assertEqual((c.exception.section, c.exception.index), (lc.SEC_GAIN, 2 * 41 + 5))
+        entries[2].zeta[5] = 1 + 0j
+        entries[3].nu[6] = 5 + 0j
+        entries[3].nu_phase_mask = 1 << 6
+        with self.assertRaises(lc.OcalValidationError) as c:
+            lc.validate_section(lc.SEC_GAIN, lc.pack_gain(entries))
+        self.assertEqual(c.exception.index, 3 * 41 + 32 + 6)
+        entries[3].nu_phase_mask = 0
+        entries[4].pad = 1
+        with self.assertRaises(lc.OcalValidationError) as c:
+            lc.validate_section(lc.SEC_GAIN, lc.pack_gain(entries))
+        self.assertEqual(c.exception.index, 4 * 41 + 40)
+
+    def test_clip_settle_monitor_bias_rules(self):
+        def bad(sid, data, index):
+            with self.assertRaises(lc.OcalValidationError) as c:
+                lc.validate_section(sid, data)
+            self.assertEqual((c.exception.section, c.exception.index), (sid, index))
+        clip = [(0, 4095)] * 16
+        lc.validate_section(lc.SEC_CLIP, lc.pack_clip(clip))
+        clip[9] = (0, 3601)                       # hi - lo = 3601 > 3600
+        lc.validate_section(lc.SEC_CLIP, lc.pack_clip(clip))
+        clip[9] = (0, 3600)                       # 3600 is not above 3600
+        bad(lc.SEC_CLIP, lc.pack_clip(clip), 9)
+        clip[9] = (100, 4096)                     # hi above 4095
+        bad(lc.SEC_CLIP, lc.pack_clip(clip), 9)
+        clip[9] = (4000, 4095)                    # a window of 95 counts
+        bad(lc.SEC_CLIP, lc.pack_clip(clip), 9)
+        table = [[26] * 6 for _ in range(7)]
+        for v in (1, 500):
+            table[3][4] = v
+            lc.validate_section(lc.SEC_SETTLE, lc.pack_settle(table))
+        for v in (0, 501):
+            table[3][4] = v
+            bad(lc.SEC_SETTLE, lc.pack_settle(table), 3 * 6 + 4)
+        kv = [0.0] * 6
+        lc.validate_section(lc.SEC_MONITOR, lc.pack_monitor(0, kv))      # unset bits are not checked
+        for v in (1e-6, 1.0):
+            kv[2] = v
+            lc.validate_section(lc.SEC_MONITOR, lc.pack_monitor(1 << 2, kv))
+        for v in (2e-7, 1.0001, math.nan):
+            kv[2] = v
+            bad(lc.SEC_MONITOR, lc.pack_monitor(1 << 2, kv), 2)
+        bad(lc.SEC_MONITOR, lc.pack_monitor(0x40, [0.01] * 6), 0)
+        for limit in (1, 4095):
+            lc.validate_section(lc.SEC_BIAS, lc.pack_bias(limit))
+        for limit, pad in ((0, 0), (4096, 0), (10, 1)):
+            bad(lc.SEC_BIAS, lc.pack_bias(limit, pad), 0)
+
+    def test_structure(self):
+        w = struct.pack
+        for body, section in ((w("<HH", 2, 4) + b"\0" * 4 + w("<HH", 1, 4) + b"\0" * 4, 1),   # ids descend
+                              (w("<HH", 5, 8) + b"\0" * 4, 5),                                # runs past the end
+                              (w("<HH", 5, 3) + b"\0" * 4, 5),                                # not a multiple of 4
+                              (meta_body() + b"\0\0", 0)):                                    # trailing bytes
+            with self.assertRaises(lc.OcalValidationError) as c:
+                lc.parse_body(body)
+            self.assertEqual((c.exception.section, c.exception.index), (section, lc.STRUCTURE_INDEX))
+        with self.assertRaises(lc.OcalValidationError):
+            lc.build_body({})                                               # 0 bytes, below 8
+        with self.assertRaises(lc.OcalValidationError):
+            lc.build_body({lc.SEC_CLIP: b"\0" * 8})                         # a known id with a wrong length
+        with self.assertRaises(lc.OcalValidationError):                     # 4 + 1992 + 4 + 600 > 0x9C0
+            lc.build_body({lc.SEC_GAIN: default_gain(), 9: b"\0" * 600})
+        body = lc.build_body({lc.SEC_META: lc.pack_meta(1, "x"), 9: b"abcd"})    # unknown ids pass
+        self.assertEqual(lc.parse_body(body)[9], b"abcd")
+        with self.assertRaises(lc.OcalValidationError):
+            lc.validate_body(b"\0" * 6)
+
+    def test_meta_and_monitor_helpers(self):
+        t, note = lc.unpack_meta(lc.pack_meta(1700000000, "a" * 40))
+        self.assertEqual((t, note), (1700000000, "a" * 28))                # the note is cut at 28
+        self.assertEqual(lc.unpack_monitor(lc.pack_monitor(5, [0.5] * 6)), (5, [0.5] * 6))
+        self.assertEqual(lc.unpack_settle(lc.pack_settle([[k] * 6 for k in range(1, 8)]))[2], [3] * 6)
+        self.assertEqual(lc.unpack_clip(lc.pack_clip([(1, 4000)] * 16))[15], (1, 4000))
+
+    def test_monitor_kv(self):
+        self.assertEqual(lc.monitor_kv(1.0, 250.0, 3), 1.0 * 8 / 250.0)       # G[3] = 8
+        self.assertAlmostEqual(lc.monitor_kv(1.0, 250.0, 3, 1.01), 8 / (250.0 * 1.01), places=12)
+        for args in ((1.0, 250.0, 8), (0.0, 250.0, 1), (1.0, 0.0, 1), (math.nan, 250.0, 1),
+                     (1.0, 250.0, 1, 0.0)):
+            with self.assertRaises(ValueError):
+                lc.monitor_kv(*args)
+        self.assertEqual(lc.OCAL_GAIN_CODES, (1, 2, 4, 8, 16, 32, 64, 128))
+        self.assertEqual(lc.OCAL_RANGE_OHM, (100, 1000, 10000, 100000))
+
+
+class OcalRecords(unittest.TestCase):
+    def test_parse_a_record(self):
+        body = meta_body("hello")
+        rec = lc.parse_ocal_record(fk.ocal_slot(fk.ocal_record(body, 5, shopen=0xCAFE)), 1)
+        self.assertTrue(rec.valid)
+        self.assertEqual((rec.slot, rec.format, rec.length, rec.sequence, rec.uid, rec.shopen_crc,
+                          rec.revoked), (1, 1, 0x40 + 36, 5, fk.INVENTED_UID, 0xCAFE, False))
+        self.assertEqual(rec.body, body)
+        self.assertTrue(rec.in_force(fk.INVENTED_UID))
+        self.assertFalse(rec.own(fk.OTHER_UID))
+        self.assertIn("sequence 5", rec.describe())
+
+    def test_revoke_word_is_outside_the_crc(self):
+        rec = lc.parse_ocal_record(fk.ocal_slot(fk.ocal_record(meta_body(), 2, revoked=True)))
+        self.assertTrue(rec.valid and rec.revoked)
+        self.assertFalse(rec.in_force(fk.INVENTED_UID))
+
+    def test_invalid_records(self):
+        body = meta_body()
+        good = bytearray(fk.ocal_slot(fk.ocal_record(body, 1)))
+        bad_body = bytearray(good)
+        bad_body[0x44] ^= 1
+        cases = [(bytes(bad_body), "CRC-32"), (b"\xFF" * 0x2000, "no magic"),
+                 (bytes(fk.ocal_slot(fk.ocal_record(body, 0))), "sequence"),
+                 (bytes(fk.ocal_slot(fk.ocal_record(body, 0xFFFFFFFF))), "sequence"),
+                 (bytes(fk.ocal_slot(fk.ocal_record(body, 1, length=101))), "length 101"),
+                 (bytes(fk.ocal_slot(fk.ocal_record(body, 1, magic=0x4C41434E))), "no magic"),
+                 (b"\0" * 10, "fewer")]
+        for data, why in cases:
+            rec = lc.parse_ocal_record(data)
+            self.assertFalse(rec.valid, why)
+            self.assertIn(why, rec.why)
+        bad_hsize = bytearray(good)
+        bad_hsize[6] = 0x44                          # header size field
+        self.assertIn("header size", lc.parse_ocal_record(bytes(bad_hsize)).why)
+
+    def test_active_record_rules(self):
+        uid = fk.INVENTED_UID
+
+        def rec(slot, seq, **kw):
+            return lc.parse_ocal_record(fk.ocal_slot(fk.ocal_record(meta_body(), seq, **kw)), slot)
+        a = lc.ocal_active_record([rec(0, 3), rec(1, 3)], uid)
+        self.assertEqual(a.slot, 0)                                       # slot 0 wins a tie
+        self.assertEqual(lc.ocal_active_record([rec(0, 3), rec(1, 4)], uid).slot, 1)
+        self.assertIsNone(lc.ocal_active_record([rec(0, 9, fmt=2), rec(1, 3)], uid))   # OF_NEWER
+        self.assertEqual(lc.ocal_active_record([rec(0, 9, uid=fk.OTHER_UID), rec(1, 3)], uid).slot, 1)
+        self.assertEqual(lc.ocal_active_record([rec(0, 9, revoked=True), rec(1, 3)], uid).slot, 1)
+        self.assertIsNone(lc.ocal_active_record([rec(0, 9, revoked=True), rec(1, 3, fmt=3)], uid))
+
+    def test_parsers_of_info_raw_trace_monitor_event(self):
+        d = bytearray(64)                                         # offsets of OCD 4.2, derived from the spec
+        struct.pack_into("<I", d, 0, 0x01C7)
+        d[4], d[5] = 1, 1
+        struct.pack_into("<H", d, 6, 0x08A8)
+        struct.pack_into("<III", d, 8, 7, 6, 0xAABBCCDD)
+        d[20], d[21], d[22], d[23] = 0x1B, 0x04, 0x14, 0x04
+        struct.pack_into("<H", d, 24, 120)
+        struct.pack_into("<I", d, 28, 1700000000)
+        d[32:37] = b"hello"
+        i = lc.parse_ocal_info(bytes(d))
+        self.assertEqual((i.flags, i.active_slot, i.format, i.active_length, i.active_sequence,
+                          i.other_sequence, i.active_crc, i.sections_present, i.gain_frequencies,
+                          i.monitor_frequencies, i.sections_rejected, i.t_max, i.meta_time,
+                          i.meta_note),
+                         (0x1C7, 1, 1, 0x8A8, 7, 6, 0xAABBCCDD, 0x1B, 4, 0x14, 4, 120, 1700000000,
+                          "hello"))
+        self.assertTrue(i.active and i.flag(lc.OF_RETAKE) and i.flag(lc.OF_LOCK))
+        self.assertTrue(i.has_section(lc.SEC_GAIN) and not i.has_section(lc.SEC_CLIP))
+        self.assertEqual((i.gain_hz(), i.monitor_hz(), i.rejected_names()),
+                         ([1000], [1000, 100000], ["CLIP"]))
+        with self.assertRaises(base.DeviceError):
+            lc.parse_ocal_info(bytes(63))
+        r = bytearray(64)                                         # OCD 4.1 0x35 offsets
+        struct.pack_into("<I", r, 0, 41)
+        r[4:8] = bytes([3, 4, 2, 1])
+        struct.pack_into("<I", r, 8, 10000)
+        struct.pack_into("<ff", r, 12, 0.5, 1.25)
+        struct.pack_into("<H", r, 20, 30)
+        r[22], r[23] = 1, 3
+        struct.pack_into("<ffffff", r, 24, 100.0, -2.0, 2000.0, 1500.0, 1.0, 2.0)
+        struct.pack_into("<HHHHHH", r, 48, 3000, 1000, 2000, 2900, 1100, 2001)
+        raw = lc.parse_ocal_raw(bytes(r))
+        self.assertEqual((raw.window, raw.cell, raw.locked, raw.frequency, raw.level, raw.bias,
+                          raw.n, raw.cls, raw.flags), (41, (3, 4, 2), True, 10000, 0.5, 1.25, 30, 1, 3))
+        self.assertEqual((raw.z_re, raw.z_im, raw.a_v, raw.a_i, raw.sigma2_v, raw.sigma2_i),
+                         (100.0, -2.0, 2000.0, 1500.0, 1.0, 2.0))
+        self.assertEqual((raw.max1, raw.min1, raw.mid1, raw.max2, raw.min2, raw.mid2),
+                         (3000, 1000, 2000, 2900, 1100, 2001))
+        self.assertTrue(raw.saturated and raw.overload)
+        self.assertEqual(raw.znom, complex(100.0, -2.0))
+        # variance of log Z: (1 / 2000^2 + 2 / 1500^2) / (64 * 30)
+        self.assertAlmostEqual(raw.variance(), (1 / 4e6 + 2 / 2.25e6) / 1920, delta=1e-15)
+        self.assertEqual(lc.parse_ocal_raw(fk.build_ocal_raw(a_v=0.0)).variance(), math.inf)
+        t = fk.build_ocal_trace(3, 2, 1000, 32, [(1005, 1500.0, 0.0, 1, 2, 2, 1),
+                                                  (1010, 1400.0, -1.0, 0, 2, 2, 1)])
+        tr = lc.parse_ocal_trace(t)
+        self.assertEqual((tr.state, tr.state_name, tr.kind, tr.change_tick, tr.count, len(tr.entries)),
+                         (3, "full", 2, 1000, 32, 2))
+        self.assertEqual((tr.entries[0].tick, tr.entries[0].discarded, tr.entries[1].z),
+                         (1005, True, complex(1400.0, -1.0)))
+        with self.assertRaises(base.DeviceError):
+            lc.parse_ocal_trace(t[:-1])
+        m = lc.parse_monitor(fk.build_monitor(1.5, 0.25, 100.0, 4.0, 0x0B, 2048, 2047, 9))
+        self.assertEqual((m.v_rms, m.i_rms, m.a_v_ref, m.a_i_ref, m.mid1, m.mid2, m.window),
+                         (1.5, 0.25, 100.0, 4.0, 2048, 2047, 9))
+        self.assertTrue(m.v_calibrated and m.gain_applied and m.lock and not m.no_reading)
+        self.assertEqual(len(fk.build_monitor()), 25)
+        ev = lc.parse_event(0x98, struct.pack("<BII", 1, 7, 0x13))
+        self.assertEqual((ev.name, ev.fields), ("OCAL_CHANGED", dict(slot=1, sequence=7, flags=0x13)))
+        self.assertTrue(lc.parse_event(0x98, b"\x01").fields["malformed"])
+
+
+class OcalCommands(unittest.TestCase):
+    def bench(self, **kw):
+        kw.setdefault("caps", fk.OCAL_CAPS)
+        return Bench(self, **kw)
+
+    def test_table_and_constants(self):
+        self.assertEqual((lc.CAP_OCAL, fk.OCAL_CAPS, lc.EV_OCAL_CHANGED), (26, 0x05EFFFFF, 0x98))
+        names = ["OCAL_INFO", "OCAL_READ", "OCAL_WRITE", "OCAL_ROLLBACK", "OCAL_LOCK", "OCAL_RAW",
+                 "OCAL_TRACE", "MONITOR"]
+        for code, name in zip(range(0x30, 0x38), names):
+            c = lc.COMMANDS[code]
+            self.assertEqual((c.name, c.cap_bit), (name, 26))
+            self.assertEqual(c.dangerous, name in ("OCAL_WRITE", "OCAL_ROLLBACK"))
+            self.assertEqual(c.timeout, 4.0 if c.dangerous else 1.5)
+
+    def test_without_bit_26_nothing_is_sent_to_the_area(self):
+        b = Bench(self, caps=fk.NEW_CAPS)
+        with self.assertRaises(base.CapabilityError):
+            b.dev.ocal_info()
+        with self.assertRaises(base.CapabilityError):
+            b.dev.ocal_write(meta_body(), "OK")
+        with self.assertRaises(base.CapabilityError):
+            b.dev.monitor()
+        self.assertEqual([c for c, _p in b.meter.log if 0x30 <= c <= 0x37], [])
+        self.assertEqual(b.meter.handle(0x30, b"")[0], 1)                  # the fake answers status 1
+
+    def test_info_of_an_empty_area(self):
+        b = self.bench()
+        i = b.dev.ocal_info()
+        self.assertEqual((i.flags, i.active_slot, i.format, i.active_length, i.active_sequence,
+                          i.other_sequence, i.t_max, i.meta_time, i.meta_note, len(i.raw)),
+                         (0, 0xFF, 0, 0, 0, 0, 26, 0, "", 64))
+        self.assertFalse(i.active)
+        self.assertIn("no active record", i.describe())
+
+    def test_info_of_a_record_with_every_section(self):
+        b = self.bench()
+        gain = [lc.GainFreq() for _ in range(6)]
+        gain[2] = lc.GainFreq(1 << 1, 1 << 1, 1 << 1, 1 << 1)          # cell c5 1, c6 1, c8 0: all four bits
+        gain[0] = lc.GainFreq(1 << 1, 0, 1 << 1, 0)                     # magnitude only: not counted
+        table = [[26] * 6 for _ in range(7)]
+        table[1][3] = 120
+        body = fk.ocal_body(meta=fk.ocal_meta(1700000000, "hello"), gain=lc.pack_gain(gain),
+                            settle=lc.pack_settle(table),
+                            monitor=lc.pack_monitor(0x14, [0, 0, 0.01, 0, 0.02, 0]))
+        self.assertEqual(len(body), 36 + 1996 + 88 + 32)
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(body, 7, shopen=b.meter.shopen_crc))
+        i = b.dev.ocal_info()
+        # flags: active 1 + slot 0 valid 2 + retake 64 (GAIN with the current short / open CRC)
+        self.assertEqual((i.flags, i.active_slot, i.format, i.active_length, i.active_sequence,
+                          i.other_sequence), (67, 0, 1, 0x40 + len(body), 7, 0))
+        self.assertEqual(i.active_crc, struct.unpack_from("<I", b.meter.slots[0], 0x3C)[0])
+        self.assertEqual((i.sections_present, i.gain_frequencies, i.monitor_frequencies,
+                          i.sections_rejected, i.t_max, i.meta_time, i.meta_note),
+                         (0b11011, 4, 0x14, 0, 120, 1700000000, "hello"))
+        self.assertEqual((i.gain_hz(), i.monitor_hz()), ([1000], [1000, 100000]))
+        self.assertTrue(i.flag(lc.OF_RETAKE))
+        b.meter.shopen_crc = 1                                          # a new short / open: retake done
+        self.assertFalse(b.dev.ocal_info().flag(lc.OF_RETAKE))
+
+    def test_info_rejects_a_bad_section_and_skips_unknown_ones(self):
+        b = self.bench()
+        clip = lc.pack_clip([(0, 4095)] * 3 + [(0, 3000)] + [(0, 4095)] * 12)
+        body = fk.ocal_section(2, clip) + fk.ocal_section(3, b"\0" * 8) + fk.ocal_section(9, b"abcd")
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(body, 1))
+        i = b.dev.ocal_info()
+        # active 1 + slot 0 valid 2 + OF_SECT 32; CLIP (bit 2) and SETTLE (bit 3) rejected
+        self.assertEqual((i.flags, i.sections_rejected, i.sections_present, i.t_max),
+                         (35, 0b1100, 0, 26))
+        self.assertEqual(i.rejected_names(), ["CLIP", "SETTLE"])
+
+    def test_read_arguments_and_the_two_slots(self):
+        b = self.bench()
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(meta_body(), 1))
+        self.assertEqual(b.dev.ocal_read(0, 0, 4), b"OCAL")                 # 0x4C41434F little-endian
+        self.assertEqual(b.sent(lc.OCAL_READ)[-1][1], struct.pack("<BHH", 0, 0, 4))
+        for args in ((2, 0, 4), (0, 0, 0), (0, 0, 257), (0, 0x1F01, 256), (0, -1, 4)):
+            with self.assertRaises(ValueError):
+                b.dev.ocal_read(*args)
+        both = b.dev.ocal_read_slots()
+        self.assertEqual(len(both), 0x4000)
+        self.assertEqual(both[:0x2000], bytes(b.meter.slots[0]))
+        self.assertEqual(both[0x2000:], b"\xFF" * 0x2000)
+        self.assertEqual(len(b.sent(lc.OCAL_READ)), 1 + 64)                 # 2 x 32 requests of 256 bytes
+        recs = b.dev.ocal_records()
+        self.assertEqual([r.valid for r in recs], [True, False])
+
+    def test_backup_file_is_named_bound_and_not_repeated(self):
+        b = self.bench()
+        folder = b.tmp / "bk"
+        p = b.dev.ocal_backup(folder)
+        self.assertEqual(p, folder / ("LC1020E-" + UID_HEX) / ("LC1020E-%s-20261121-100001.ocal" % UID_HEX))
+        self.assertEqual(p.read_bytes(), b"\xFF" * 0x4000)
+        self.assertEqual(b.dev.ocal_backup(folder), p)                     # same bytes: no new file
+        self.assertEqual(len(list(p.parent.glob("*.ocal"))), 1)
+        b.meter.slots[1] = fk.ocal_slot(fk.ocal_record(meta_body(), 2))
+        q = b.dev.ocal_backup(folder)
+        self.assertNotEqual(q, p)
+        self.assertEqual(q.read_bytes()[0x2000:0x2004], b"OCAL")
+        self.assertEqual(b.dev.list_ocal_backups(folder), [q, p])         # newest first
+        self.assertEqual(lc.LC1020E.load_ocal_file(q, UID_HEX), q.read_bytes())
+
+    def test_backup_refuses_another_meter(self):
+        b = self.bench()
+        b.meter.uid = fk.OTHER_UID
+        with self.assertRaises(lc.BackupMismatch):
+            b.dev.ocal_backup(b.tmp / "bk")
+        self.assertFalse((b.tmp / "bk").exists())
+
+    def test_write_backs_up_first_and_fills_slot_0(self):
+        b = self.bench()
+        ev = []
+        b.dev.meter_event.connect(ev.append)
+        body = meta_body("first")
+        res = b.dev.ocal_write(body, "OK")
+        self.assertEqual((res.result, res.slot, res.sequence, res.ok), (0, 0, 1, True))
+        codes = [c for c, _p, _t in b.link.requests]
+        self.assertEqual(codes.count(lc.OCAL_READ), 64)
+        self.assertLess(max(i for i, c in enumerate(codes) if c == lc.OCAL_READ),
+                        codes.index(lc.OCAL_WRITE))                          # backup first
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        self.assertEqual(b.sent(lc.OCAL_WRITE)[0][1], struct.pack("<HHHI", 0x4F4B, 0, 36, crc) + body)
+        self.assertEqual(b.link.requests[codes.index(lc.OCAL_WRITE)][2], 4.0)
+        file = next((b.tmp / "bk").rglob("*.ocal"))
+        self.assertEqual(file.read_bytes(), b"\xFF" * 0x4000)                # as it was before the write
+        rec = lc.parse_ocal_record(bytes(b.meter.slots[0]), 0)
+        self.assertEqual((rec.valid, rec.sequence, rec.uid, rec.length, rec.body),
+                         (True, 1, fk.INVENTED_UID, 100, body))
+        self.assertEqual(rec.shopen_crc, b.meter.shopen_crc)
+        i = b.dev.ocal_info()
+        self.assertEqual((i.flags, i.active_slot, i.active_sequence, i.meta_note), (3, 0, 1, "first"))
+        self.assertEqual([(e.name, e.fields) for e in ev],
+                         [("OCAL_CHANGED", dict(slot=0, sequence=1, flags=3))])
+
+    def test_chunks(self):
+        b = self.bench()
+        body = meta_body()
+        b.dev.ocal_write(body, "OK", chunk=10)
+        sent = [p for _c, p in b.sent(lc.OCAL_WRITE)]
+        self.assertEqual([struct.unpack_from("<H", p, 2)[0] for p in sent], [0, 10, 20, 30])
+        self.assertEqual([len(p) - 10 for p in sent], [10, 10, 10, 6])
+        self.assertEqual(b"".join(p[10:] for p in sent), body)
+        self.assertEqual({p[4:10] for p in sent}, {struct.pack("<HI", 36, zlib.crc32(body) & 0xFFFFFFFF)})
+        for chunk in (0, 503):
+            with self.assertRaises(ValueError):
+                b.dev.ocal_write(body, "OK", chunk=chunk)
+        self.assertEqual(lc.parse_ocal_record(bytes(b.meter.slots[0])).body, body)
+
+    def test_slots_alternate_and_sequences_count(self):
+        b = self.bench()
+        got = [b.dev.ocal_write(meta_body(n), "OK") for n in "abc"]
+        self.assertEqual([(r.slot, r.sequence) for r in got], [(0, 1), (1, 2), (0, 3)])
+        i = b.dev.ocal_info()
+        self.assertEqual((i.active_slot, i.active_sequence, i.other_sequence), (0, 3, 2))
+        self.assertEqual(len(list((b.tmp / "bk").rglob("*.ocal"))), 3)       # one backup before each
+
+    def test_refusals_without_confirmation_validation_or_folder(self):
+        b = self.bench()
+        with self.assertRaises(base.SafetyRefused):
+            b.dev.ocal_write(meta_body(), "ok")
+        bad = struct.pack("<HH", 2, 64) + lc.pack_clip([(0, 3000)] * 16)
+        with self.assertRaises(lc.OcalValidationError):
+            b.dev.ocal_write(bad, "OK")
+        with self.assertRaises(base.SafetyRefused):
+            b.dev.ocal_rollback(0, "no")
+        self.assertEqual(b.link.requests, [])                              # nothing was sent at all
+        nofolder = lc.LC1020E(b.link, base.Info.parse(b.meter.info()), backup_folder=None)
+        with self.assertRaises(base.SafetyRefused):
+            nofolder.ocal_write(meta_body(), "OK")
+        with self.assertRaises(base.SafetyRefused):
+            nofolder.ocal_rollback(0, "OK")
+        self.assertEqual(b.link.requests, [])
+
+    def test_meter_side_validation_and_crc(self):
+        b = self.bench()
+        clip = lc.pack_clip([(0, 4095)] * 3 + [(0, 3000)] + [(0, 4095)] * 12)
+        body = struct.pack("<HH", 2, 64) + clip                             # the host would refuse it
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        with self.assertRaises(base.StatusError) as c:
+            b.dev._ocal_write_once(body, 502, crc)
+        self.assertEqual((c.exception.status, c.exception.data), (2, bytes([2, 3, 0])))
+        self.assertIn("CLIP entry 3", c.exception.detail)
+        with self.assertRaises(base.StatusError) as c:
+            b.dev._ocal_write_once(meta_body(), 502, 12345)
+        self.assertEqual((c.exception.status, c.exception.data), (7, b""))
+        self.assertEqual(b.meter.ocal_ops, [])
+        self.assertEqual(b.meter.slots[0], bytearray(b"\xFF" * 0x2000))
+        self.assertIsNone(b.meter.ocal_xfer)
+
+    def test_transfer_rules(self):
+        b = self.bench()
+        body = meta_body()
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        head = lambda off, total=36, c=crc: struct.pack("<HHHI", 0x4F4B, off, total, c)    # noqa: E731
+        h = b.meter.handle
+        self.assertEqual(h(lc.OCAL_WRITE, head(0) + body[:10]), (0, struct.pack("<H", 10)))
+        self.assertEqual(h(lc.OCAL_WRITE, head(20) + body[20:30])[0], 2)               # not the offset asked
+        self.assertEqual(h(lc.OCAL_WRITE, head(10, 40) + body[10:20])[0], 2)           # another total
+        self.assertEqual(h(lc.OCAL_WRITE, head(10, 36, crc ^ 1) + body[10:20])[0], 2)  # another CRC
+        self.assertEqual(h(lc.OCAL_WRITE, head(10) + body[10:] + b"xx")[0], 2)         # past the total
+        self.assertEqual(h(lc.OCAL_WRITE, head(10) + body[10:20]), (0, struct.pack("<H", 20)))
+        self.assertEqual(h(lc.OCAL_WRITE, head(0) + body[:10]), (0, struct.pack("<H", 10)))   # offset 0 restarts
+        self.assertEqual(h(lc.OCAL_WRITE, b"\x4b\x4f\0\0")[0], 2)                      # too short
+        self.assertEqual(h(lc.OCAL_WRITE, struct.pack("<HHHI", 0x4F4C, 0, 36, crc) + body[:10])[0], 2)
+        self.assertEqual(h(lc.OCAL_WRITE, struct.pack("<HHHI", 0x4F4B, 0, 6, crc) + body[:6])[0], 2)
+        self.assertEqual(h(lc.OCAL_WRITE, head(0, 36) + b"")[0], 2)                   # no chunk
+        # the transfer sits at offset 10 again: its last chunk completes the body and commits
+        self.assertEqual(h(lc.OCAL_WRITE, head(10) + body[10:]), (0, struct.pack("<BBI", 0, 0, 1)))
+        self.assertEqual(h(lc.OCAL_WRITE, head(10) + body[10:])[0], 2)              # closed: offset 10 is not a start
+
+    def test_refused_last_chunk_leaves_the_transfer_open(self):
+        b = self.bench()
+        body = meta_body()
+        for flag, status in (("off_mode", 3), ("cal_running", 6), ("job_active", 4), ("rewrite_a", 4)):
+            setattr(b.meter, flag, True)
+            with self.assertRaises(base.StatusError) as c:
+                b.dev.ocal_write(body, "OK", chunk=20)
+            self.assertEqual(c.exception.status, status, flag)
+            self.assertIsNotNone(b.meter.ocal_xfer)
+            self.assertEqual(b.meter.ocal_ops, [])
+            setattr(b.meter, flag, False)
+        b.meter.off_mode = b.meter.cal_running = True                       # the order of OCD 4.3: 3 first
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.ocal_write(body, "OK", chunk=20)
+        self.assertEqual(c.exception.status, 3)
+        b.meter.off_mode = b.meter.cal_running = False
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        # the same last chunk again, as the host may after a refusal (the transfer sits at offset 0 of
+        # the 20-byte chunk's predecessor: restarted here with the whole first chunk)
+        self.assertEqual(b.meter.handle(lc.OCAL_WRITE, struct.pack("<HHHI", 0x4F4B, 0, 36, crc) + body[:20])[0], 0)
+        self.assertEqual(b.meter.handle(lc.OCAL_WRITE, struct.pack("<HHHI", 0x4F4B, 20, 36, crc) + body[20:]),
+                         (0, struct.pack("<BBI", 0, 0, 1)))
+
+    def test_flash_failure_and_the_retry(self):
+        b = self.bench()
+        b.meter.ocal_fail_attempts = 2
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.ocal_write(meta_body(), "OK")
+        self.assertEqual(c.exception.status, 5)
+        self.assertEqual((c.exception.record.result, c.exception.record.slot, c.exception.record.sequence),
+                         (5, 0xFF, 0))
+        self.assertIn("read-back differs", c.exception.record.describe())
+        self.assertEqual(b.meter.ocal_ops, [("erase", 0, 0), ("erase", 0, 0)])
+        self.assertFalse(b.dev.ocal_info().active)
+        b.meter.ocal_ops.clear()
+        b.meter.ocal_fail_attempts = 1                                       # the retry succeeds
+        res = b.dev.ocal_write(meta_body(), "OK")
+        self.assertEqual((res.slot, res.sequence), (0, 1))
+        # one failed attempt, then 1 page erase, 100 / 4 - 1 = 24 words (the CRC word is last), the CRC word
+        self.assertEqual(b.meter.ocal_ops, [("erase", 0, 0), ("erase", 0, 0), ("program", 0, 24),
+                                            ("crc", 0, 1)])
+
+    def test_the_previous_record_survives_a_failed_write(self):
+        b = self.bench()
+        b.dev.ocal_write(meta_body("a"), "OK")
+        before = bytes(b.meter.slots[0])
+        b.meter.ocal_fail_attempts = 2
+        with self.assertRaises(base.StatusError):
+            b.dev.ocal_write(meta_body("b"), "OK")
+        self.assertEqual(bytes(b.meter.slots[0]), before)
+        i = b.dev.ocal_info()
+        self.assertEqual((i.active_slot, i.active_sequence), (0, 1))
+
+    def test_rollback_modes_and_the_target_after_it(self):
+        b = self.bench()
+        b.dev.ocal_write(meta_body("a"), "OK")               # slot 0, sequence 1
+        b.dev.ocal_write(meta_body("b"), "OK")               # slot 1, sequence 2: active
+        r = b.dev.ocal_rollback(0, "OK")
+        self.assertEqual((r.slot, r.sequence, r.flags, r.active), (0, 1, 7, True))      # active 1 + both valid 2 + 4
+        self.assertEqual(b.sent(lc.OCAL_ROLLBACK)[-1][1], b"\x4b\x4f\x00")
+        self.assertEqual(b.meter.ocal_ops[-1], ("revoke", 1, 1))
+        self.assertIn("slot 0", r.describe())
+        res = b.dev.ocal_write(meta_body("c"), "OK")         # the revoked slot is the target (OCD 1.4 step 1 a)
+        self.assertEqual((res.slot, res.sequence), (1, 3))
+        b.meter.ocal_ops.clear()
+        r = b.dev.ocal_rollback(1, "OK")                      # every own format-1 record, the older first
+        self.assertEqual((r.slot, r.sequence, r.flags, r.active), (0xFF, 0, 6, False))
+        self.assertEqual(b.meter.ocal_ops, [("revoke", 0, 1), ("revoke", 1, 1)])
+        self.assertEqual(b.sent(lc.OCAL_ROLLBACK)[-1][1], b"\x4b\x4f\x01")
+        self.assertIn("no record active", r.describe())
+        for mode in (0, 1):                                   # nothing qualifies any more: status 3
+            with self.assertRaises(base.StatusError) as c:
+                b.dev.ocal_rollback(mode, "OK")
+            self.assertEqual(c.exception.status, 3)
+        with self.assertRaises(ValueError):
+            b.dev.ocal_rollback(2, "OK")
+        codes = [c for c, _p, _t in b.link.requests]
+        self.assertLess(codes.index(lc.OCAL_READ), codes.index(lc.OCAL_ROLLBACK))
+
+    def test_rollback_refusals(self):
+        b = self.bench()
+        b.dev.ocal_write(meta_body(), "OK")
+        for flag, status in (("off_mode", 3), ("cal_running", 6), ("job_active", 4)):
+            setattr(b.meter, flag, True)
+            with self.assertRaises(base.StatusError) as c:
+                b.dev.ocal_rollback(0, "OK")
+            self.assertEqual(c.exception.status, status)
+            setattr(b.meter, flag, False)
+        self.assertEqual(b.dev.ocal_info().active_slot, 0)
+
+    def test_foreign_record_rules(self):
+        b = self.bench()
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(meta_body("x"), 5, uid=fk.OTHER_UID))
+        i = b.dev.ocal_info()
+        self.assertEqual((i.flags, i.active_slot), (0x12, 0xFF))              # slot 0 valid + OF_UID
+        foreign = bytes(b.meter.slots[0])
+        res = b.dev.ocal_write(meta_body("mine"), "OK")                      # the empty slot, sequence 5 + 1
+        self.assertEqual((res.slot, res.sequence), (1, 6))
+        self.assertEqual(bytes(b.meter.slots[0]), foreign)
+        i = b.dev.ocal_info()
+        self.assertEqual((i.flags, i.active_slot, i.other_sequence), (23, 1, 5))
+        # a newer foreign record next to this meter's own: the own one is active, the foreign is overwritten
+        b = self.bench()
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(meta_body("x"), 9, uid=fk.OTHER_UID))
+        b.meter.slots[1] = fk.ocal_slot(fk.ocal_record(meta_body("y"), 3))
+        self.assertEqual(b.dev.ocal_info().active_slot, 1)
+        res = b.dev.ocal_write(meta_body("z"), "OK")
+        self.assertEqual((res.slot, res.sequence), (0, 10))
+
+    def test_newer_format_is_not_applied_and_the_older_slot_is_overwritten(self):
+        b = self.bench()
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(meta_body("n"), 9, fmt=2))
+        b.meter.slots[1] = fk.ocal_slot(fk.ocal_record(meta_body("o"), 3))
+        i = b.dev.ocal_info()
+        self.assertEqual((i.flags, i.active_slot), (14, 0xFF))                # both valid 2 + 4, OF_NEWER 8
+        res = b.dev.ocal_write(meta_body("w"), "OK")                         # the format-1 slot, sequence 10
+        self.assertEqual((res.slot, res.sequence), (1, 10))
+        self.assertEqual(b.dev.ocal_info().active_slot, 1)
+
+    def test_sequence_overflow_is_refused(self):
+        b = self.bench()
+        b.meter.slots[0] = fk.ocal_slot(fk.ocal_record(meta_body(), 0xFFFFFFFE))
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.ocal_write(meta_body(), "OK")
+        self.assertEqual(c.exception.status, 3)
+        self.assertEqual(b.meter.ocal_ops, [])
+
+    def test_restore_a_record_from_a_backup_file(self):
+        b = self.bench()
+        body_a, body_b = meta_body("A"), meta_body("B")
+        b.dev.ocal_write(body_a, "OK")
+        b.dev.ocal_write(body_b, "OK")
+        path = b.dev.ocal_backup(b.tmp / "bk")
+        res = b.dev.ocal_restore(path, 0, "OK")                              # slot 0's record, written again
+        self.assertEqual((res.slot, res.sequence), (0, 3))                   # the active one is slot 1
+        rec = lc.parse_ocal_record(bytes(b.meter.slots[0]))
+        self.assertEqual((rec.sequence, rec.body), (3, body_a))
+        with self.assertRaises(base.SafetyRefused):
+            b.dev.ocal_restore(path, 0, "no")
+
+    def test_restore_refusals_send_nothing(self):
+        b = self.bench()
+        body = meta_body("A")
+        b.dev.ocal_write(body, "OK")
+        path = b.dev.ocal_backup(b.tmp / "bk")
+        n = len(b.link.requests)
+        other = path.with_name(path.name.replace(UID_HEX, fk.OTHER_UID.hex().upper()))
+        shutil.copy(path, other)
+        with self.assertRaises(lc.BackupMismatch) as c:
+            b.dev.ocal_restore(other, 0, "OK")                               # another UID in the name
+        self.assertIn("refused", str(c.exception))
+        named = path.with_name("LC1020E-%s-20261121-120000.ocal" % UID_HEX)
+        slots = [bytes(fk.ocal_slot(fk.ocal_record(body, 4, uid=fk.OTHER_UID))),
+                 bytes(fk.ocal_slot(fk.ocal_record(body, 5, fmt=2)))]
+        named.write_bytes(slots[0] + slots[1])
+        for slot, why in ((0, "carries UID"), (1, "format 2")):
+            with self.assertRaises(lc.BackupMismatch) as c:
+                b.dev.ocal_restore(named, slot, "OK")
+            self.assertIn(why, str(c.exception))
+        named.write_bytes(b"\xFF" * 0x4000)
+        with self.assertRaises(lc.BackupMismatch) as c:
+            b.dev.ocal_restore(named, 1, "OK")
+        self.assertIn("no valid record", str(c.exception))
+        short = path.with_name("LC1020E-%s-20261121-130000.ocal" % UID_HEX)
+        short.write_bytes(b"\0" * 100)
+        for p in (short, path.with_name("backup.ocal")):
+            with self.assertRaises(lc.BackupMismatch):
+                b.dev.ocal_restore(p, 0, "OK")
+        with self.assertRaises(ValueError):
+            b.dev.ocal_restore(path, 2, "OK")
+        self.assertEqual(len(b.link.requests), n)
+
+    def test_update_sections_keeps_the_others(self):
+        b = self.bench()
+        info, secs = b.dev.ocal_active_sections()
+        self.assertEqual((info.active, secs), (False, {}))
+        clip = lc.pack_clip([(0, 4095)] * 16)
+        b.dev.ocal_write(lc.build_body({lc.SEC_META: lc.pack_meta(5, "old"), lc.SEC_CLIP: clip}), "OK")
+        settle = lc.pack_settle([[40] * 6 for _ in range(7)])
+        res = b.dev.ocal_update_sections({lc.SEC_SETTLE: settle}, "OK", note="gain")
+        self.assertEqual((res.slot, res.sequence), (1, 2))
+        info, secs = b.dev.ocal_active_sections()
+        self.assertEqual((info.active_slot, sorted(secs)), (1, [0, 2, 3]))
+        self.assertEqual((secs[lc.SEC_CLIP], secs[lc.SEC_SETTLE]), (clip, settle))
+        t, note = lc.unpack_meta(secs[lc.SEC_META])
+        self.assertEqual(note, "gain")
+        self.assertTrue(1.7e9 < t < 1.9e9)
+        b.dev.ocal_update_sections({lc.SEC_CLIP: None}, "OK")                  # a section dropped
+        info, secs = b.dev.ocal_active_sections()
+        self.assertEqual(sorted(secs), [0, 3])
+        self.assertEqual(lc.unpack_meta(secs[lc.SEC_META])[1], "gain")         # META kept without a note
+        with self.assertRaises(base.SafetyRefused):
+            b.dev.ocal_update_sections({}, "x")
+
+    def test_lock_release_raw_and_waiting(self):
+        b = self.bench()
+        raw = b.dev.ocal_lock(1, 2, 3)
+        self.assertEqual(b.sent(lc.OCAL_LOCK)[-1][1], bytes([1, 2, 3]))
+        self.assertEqual((raw.cell, raw.locked, raw.frequency, raw.window), ((1, 2, 3), True, 1000, 101))
+        raw = b.dev.ocal_release()
+        self.assertEqual(b.sent(lc.OCAL_LOCK)[-1][1], b"\xFF\xFF\xFF")
+        self.assertFalse(raw.locked)
+        self.assertEqual(raw.cell, (2, 2, 1))                                  # |Z| 1000: range code 1
+        for args in ((8, 0, 0), (0, 8, 0), (0, 0, 4), (-1, 0, 0)):
+            with self.assertRaises(ValueError):
+                b.dev.ocal_lock(*args)
+        before = b.dev.ocal_raw().window
+        self.assertEqual(b.dev.ocal_wait_window(before, 2).window, before + 2)     # the fake counts +1 per read
+        with self.assertRaises(base.DeviceError):
+            b.dev.ocal_wait_window(10 ** 6, 1, timeout=3.0)
+
+    def test_lock_refusals(self):
+        b = self.bench()
+        b.meter.screen = 2
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.ocal_lock(1, 1, 1)
+        self.assertEqual(c.exception.status, 3)
+        b.meter.screen = 1
+        b.meter.cal_running = True
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.ocal_lock(1, 1, 1)
+        self.assertEqual(c.exception.status, 6)
+        b.meter.cal_running, b.meter.off_mode = False, True
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.ocal_release()
+        self.assertEqual(c.exception.status, 3)
+        b.meter.off_mode = False
+        b.dev.ocal_lock(1, 1, 1)
+        with self.assertRaises(base.StatusError) as c:
+            b.dev.lcr_set(5, 0)                                                # the range, while locked: OCD 2.2
+        self.assertEqual(c.exception.status, 3)
+
+    def test_trace(self):
+        b = self.bench()
+        self.assertEqual(b.dev.ocal_trace_arm().state, 1)
+        self.assertEqual(b.sent(lc.OCAL_TRACE)[-1][1], bytes([1, 0]))
+        b.dev.lcr_set(2, 1)                                                    # the traced change: a frequency
+        t = b.dev.ocal_trace_read_all()
+        self.assertEqual([p for _c, p in b.sent(lc.OCAL_TRACE)][-2:], [bytes([2, 0]), bytes([2, 31])])
+        self.assertEqual((t.state_name, t.kind, t.change_tick, t.count, len(t.entries)), ("full", 1, 1000, 32, 32))
+        self.assertEqual([e.tick for e in t.entries[:3]], [1005, 1010, 1015])
+        self.assertEqual([e.discarded for e in t.entries[:3]], [True, True, False])
+        self.assertAlmostEqual(t.entries[0].z.real, 1500.0, delta=1e-3)        # 1000 + 500 exp(0)
+        self.assertAlmostEqual(t.entries[31].z.real, 1000.0 + 500 * math.exp(-31 / 4), delta=1e-2)
+        self.assertEqual(b.dev.ocal_trace_disarm().state, 0)
+        one = b.dev.ocal_trace_read(5)
+        self.assertEqual((one.state, one.entries), (0, []))
+        for start in (-1, 32):
+            with self.assertRaises(ValueError):
+                b.dev.ocal_trace_read(start)
+
+    def test_trace_wait_has_a_deadline(self):
+        b = self.bench()
+        b.dev.ocal_trace_arm()
+        with self.assertRaises(base.DeviceError):
+            b.dev.ocal_wait_trace(timeout=3.0)
+
+    def test_monitor(self):
+        b = self.bench()
+        m = b.dev.monitor()
+        self.assertFalse(m.v_calibrated)
+        self.assertTrue(math.isnan(m.v_rms) and math.isnan(m.i_rms))
+        b.meter.monitor_values = dict(v=1.0, i=0.5, a_v=250.0, a_i=4.0, flags=0x03)
+        m = b.dev.monitor()
+        self.assertEqual((m.v_rms, m.i_rms, m.a_v_ref, m.a_i_ref, m.v_calibrated, m.gain_applied,
+                          m.no_reading, m.lock), (1.0, 0.5, 250.0, 4.0, True, True, False, False))
+
+    def test_measure_byte_65(self):
+        b = self.bench()
+        b.meter.ocal_flags = 0b0101
+        m = b.dev.measure()
+        self.assertEqual((len(m.raw), m.markers, m.ocal_flags, m.gain_applied, m.gain_missing),
+                         (66, 0, 5, True, False))
+        b.meter.ocal_flags = 0b0010
+        m = b.dev.lcr_set(2, 1)                                                # LCR_SET answers the same record
+        self.assertEqual((m.ocal_flags, m.gain_applied, m.gain_missing), (2, False, True))
+        self.assertEqual(b.dev.measure_reading().gain_flags, 2)
+        # without bit 26 the record has 65 bytes and byte 65 is never read
+        old = Bench(self, caps=fk.NEW_CAPS)
+        m = old.dev.measure()
+        self.assertEqual((len(m.raw), m.ocal_flags, m.gain_applied), (65, None, False))
+        self.assertIsNone(old.dev.measure_reading().gain_flags)
+
+    def test_parse_measure_with_and_without_the_capability(self):
+        rec = fk.build_measure(markers=1, ocal=0b1001)
+        self.assertEqual(len(rec), 66)
+        m = lc.parse_measure(rec, True)
+        self.assertEqual((len(m.raw), m.markers, m.ocal_flags), (66, 1, 9))
+        self.assertTrue(m.gain_applied and not m.gain_missing)
+        m = lc.parse_measure(rec)                                              # the capability bit is clear
+        self.assertEqual((len(m.raw), m.markers, m.ocal_flags), (65, 1, None))
+        m = lc.parse_measure(fk.build_measure(markers=0), True)                # 65 bytes: no byte 65
+        self.assertEqual((len(m.raw), m.ocal_flags), (65, None))
+        self.assertEqual(lc.parse_measure(fk.build_measure(ocal=0)).raw, fk.build_measure(ocal=0)[:65])
+        r = lc.measure_to_reading(lc.parse_measure(rec, True), 1.0, 2.0)
+        self.assertEqual(r.gain_flags, 9)
+
+    def test_stream_reading_carries_the_gain_flags(self):
+        b = self.bench()
+        got = []
+        b.dev.reading.connect(got.append)
+        b.dev.start_live()
+        b.link.emit_stream(lc.MEASURE, fk.build_measure(markers=0, ocal=2))
+        self.assertEqual(got[0].gain_flags, 2)
+        b.dev.stop_live()
+
+
+class OcalProcedures(unittest.TestCase):
+    """The collection procedures of core/ocal_run.py against the fake meter."""
+
+    def setUp(self):
+        from fnirsi_companion.core import ocal_run, ocal_solve
+        self.run, self.solve = ocal_run, ocal_solve
+        self.b = Bench(self, caps=fk.OCAL_CAPS)
+
+    def test_meter_points(self):
+        # the fake's frequency list: 100, 1000, 10000, 100000, 120, 60 (indices 0..5)
+        by_fi, levels = self.run.meter_points(self.b.dev)
+        self.assertEqual(by_fi, {0: 0, 1: 4, 2: 1, 3: 2, 4: 3, 5: 5})
+        self.assertEqual([i for _v, i in levels], [0, 1])
+        self.assertAlmostEqual(levels[0][0], 0.1, places=6)
+        self.assertAlmostEqual(levels[1][0], 0.6, places=6)
+
+    def test_cells(self):
+        near = self.run.neighbour_cells((2, 2, 1))
+        self.assertEqual(len(near), 10)                       # c8 +-1, c5 +-1 +-2, c6 +-1 +-2: all exist
+        self.assertEqual(len(self.run.neighbour_cells((0, 0, 0))), 5)       # only the positive steps
+        self.assertEqual(len(self.run.neighbour_cells((7, 7, 3))), 5)
+        self.assertEqual(self.run.nearest_cell((2, 2, 0), {(5, 5, 3), (3, 2, 0)}), (3, 2, 0))
+        self.assertEqual(self.run.nearest_cell((2, 2, 0), {(2, 2, 0), (3, 2, 0)}), (2, 2, 0))
+        self.assertEqual(self.run.nearest_cell((2, 2, 0), set()), (2, 2, 0))
+
+    def test_collect_a_resistor(self):
+        progress = []
+        windows, notes = self.run.collect_resistor(self.b.dev, 3, lambda f, t: progress.append((f, t)))
+        # 6 frequencies x 2 levels = 12 points; each: the autoranged cell (2, 2, 1) + its 10 neighbours
+        self.assertEqual((len(windows), len(notes)), (132, 0))
+        self.assertEqual(sum(w.autoranged for w in windows), 12)
+        self.assertTrue(all(w.znom == 1000 and w.resistor == 3 for w in windows))
+        self.assertEqual({w.cell for w in windows if w.autoranged}, {(2, 2, 1)})
+        self.assertEqual({w.fi for w in windows}, {0, 1, 2, 3, 4, 5})
+        self.assertAlmostEqual(windows[0].var, 2 / 4e6 / 1920, delta=1e-15)
+        self.assertIsNone(self.b.meter.lock)                                  # released at the end
+        self.assertEqual(progress[-1][0], 1.0)
+
+    def test_weak_and_saturated_cells_are_dropped(self):
+        self.b.meter.weak_cells = {(3, 2, 1)}                                # 100 counts: below 300
+        windows, notes = self.run.collect_resistor(self.b.dev, 0)
+        self.assertEqual((len(windows), len(notes)), (120, 0))               # 12 points x (1 + 9)
+        self.assertNotIn((3, 2, 1), {w.cell for w in windows})
+        self.b.meter.weak_cells = set()
+        self.b.meter.saturated_cells = {(2, 2, 1)}                           # the autoranged cell
+        windows, notes = self.run.collect_resistor(self.b.dev, 0)
+        self.assertEqual((len(windows), len(notes)), (120, 12))              # no autoranged window, a note each
+        self.assertFalse(any(w.autoranged for w in windows))
+
+    def test_short_and_open(self):
+        self.b.meter.dut_fn = lambda hz: 0.05 + 0.01j                        # the short bar; |Z| < 300: c8 0
+        windows, notes = self.run.collect_shortopen(self.b.dev, "short", 2)
+        self.assertEqual((len(windows), len(notes)), (96, 0))                # 12 points x 8 windows
+        self.assertTrue(all(w.kind == "short" and w.take == 2 and w.cell == (2, 2, 0) for w in windows))
+        self.assertAlmostEqual(windows[0].znom.real, 0.05, places=6)
+        self.assertAlmostEqual(windows[0].znom.imag, 0.01, places=6)
+        windows, notes = self.run.collect_shortopen(self.b.dev, "short", 1, {(5, 5, 3)})
+        self.assertEqual((len(windows), len(notes)), (96, 12))
+        self.assertEqual({w.cell for w in windows}, {(5, 5, 3)})
+        self.b.meter.saturated_cells = {(2, 2, 0)}
+        windows, notes = self.run.collect_shortopen(self.b.dev, "open", 1)
+        self.assertEqual((len(windows), len(notes)), (0, 12))
+        with self.assertRaises(ValueError):
+            self.run.collect_shortopen(self.b.dev, "other")
+        self.assertIsNone(self.b.meter.lock)
+
+    def test_clip_sweep(self):
+        obs = self.run.sweep_clip(self.b.dev)
+        self.assertEqual(len(obs), 16)
+        self.assertEqual({obs[(0, c)] for c in range(8)}, {(1000, 3000)})     # (min1, max1) of the fake's raw
+        self.assertEqual({obs[(1, c)] for c in range(8)}, {(1100, 2900)})     # (min2, max2)
+        total = self.run.merge_clip({(0, 0): (10, 100)}, {(0, 0): (5, 90), (1, 1): (1, 2)})
+        self.assertEqual(total, {(0, 0): (5, 100), (1, 1): (1, 2)})
+        prop = self.solve.propose_clip(obs, 16)
+        self.assertEqual((prop[0], prop[8]), ((1016, 2984), (1116, 2884)))
+        self.assertIsNone(self.b.meter.lock)
+
+    def test_trace_kinds(self):
+        for kind in (1, 2, 6):                    # the fake offers LCR_TABLES lists 1..3 only (no bias, speed)
+            trace, ms = self.run.measure_trace(self.b.dev, kind, 2)
+            self.assertEqual((trace.kind, len(trace.entries)), (kind, 32))
+            self.assertEqual(ms, 55)          # derived in test_ocal_solve (tau 4 acquisitions of 5 ms)
+            self.assertEqual(self.b.meter.trace["state"], 0)                  # disarmed
+            self.assertIsNone(self.b.meter.lock)
+        for kind in (0, 5, 7):
+            with self.assertRaises(ValueError):
+                self.run.measure_trace(self.b.dev, kind, 2)
+        old = Bench(self, caps=fk.OCAL_CAPS & ~(1 << lc.CAP_FREQ_60HZ))
+        with self.assertRaises(base.DeviceError):
+            self.run.measure_trace(old.dev, 2, 5)                             # no 60 Hz in the meter's list
 
 
 if __name__ == "__main__":

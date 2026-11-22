@@ -404,15 +404,16 @@ class LivePage(Page):
         else:
             self.big.set_dashes("—" if reading.validity == "valid" else reading.validity)
         self.value.setText(fmt_si(record.numeric(reading), reading.unit))
-        self.validity.setText(reading.validity)
+        self.validity.setText(reading.validity + (", unspecified" if reading.unspecified else ""))
         s = reading.secondary
         if s is None or self.model is None or not self.model.secondary:
             self.big.set_secondary(None)
             self.secondary.setText("")
         else:
             self.big.set_secondary(SECONDARY_LABEL.get(s.quantity, s.quantity), s.text)
-            self.secondary.setText("secondary %s %s" % (SECONDARY_LABEL.get(s.quantity, s.quantity),
-                                                        s.validity))
+            self.secondary.setText("secondary %s %s%s" % (
+                SECONDARY_LABEL.get(s.quantity, s.quantity), s.validity,
+                ", unspecified" if s.unspecified else ""))
         if reading.validity == "unknown":
             self.note_raw.setText("Raw meter data: the meter's record carries no unit prefix and "
                                   "no reading status (DESIGN 13.4); the value is the displayed "

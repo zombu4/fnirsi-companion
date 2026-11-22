@@ -5,6 +5,10 @@ the comments; the records, parsers, file checks and the update flows are the own
 tools/lc1020e.py ("LL") ported into this structure. The parse_* functions and the check_* functions
 are pure (testable without a link). The class LC1020E(Device) works on the SerialLink of API.md.
 
+The own calibration area (commands 0x30 to 0x37, event 0x98, capability bit 26) follows OWN_CAL_DESIGN.md of
+the LC1020E repository ("OCD"): the record and section layouts, the value checks of OCD 2.4 on the host before a
+write, the .ocal backup of both slots before every write (OCD 6.1) and the OCAL_* methods.
+
 Safety (DESIGN.md 9, 13.7 to 13.9): methods that save, restart or overwrite take `confirm` and
 refuse unless it is "OK"; those that touch the settings storage (calibration, serial, options) and
 the update flows (UPDATE_MODE, BOOT_*) write a backup of both settings copies first. The generic
@@ -18,6 +22,7 @@ import json
 import math
 import os
 import queue
+import re
 import struct
 import sys
 import time
@@ -47,6 +52,7 @@ INFO, PING, RESET, BATTERY, POWER_OFF, FACTORY_MODE = 0x00, 0x01, 0x02, 0x03, 0x
 STATE, STREAM, SCREEN, KEY = 0x10, 0x11, 0x12, 0x13
 LCR_TABLES, LCR_SET, MEASURE, MEASURE_STREAM = 0x20, 0x21, 0x22, 0x23
 COMPARE, COMPARE_SET, HOLD, CALIBRATE = 0x24, 0x25, 0x26, 0x27
+TOLERANCE_SET = 0x28
 SETTINGS_TABLES, SETTINGS_SET, SETTINGS_SAVE, CAL_READ = 0x50, 0x51, 0x52, 0x53
 RESTORE_DEFAULTS, SETTINGS_RESTORE_B, SETTINGS_ACCEPT_A = 0x54, 0x55, 0x56
 SETTINGS_WRITE_BLOCK, SETUP_LANGUAGE, SETTINGS_ACCEPT_B, SETTINGS_ACCEPT_DEFAULTS = \
@@ -54,14 +60,19 @@ SETTINGS_WRITE_BLOCK, SETUP_LANGUAGE, SETTINGS_ACCEPT_B, SETTINGS_ACCEPT_DEFAULT
 SCREENSHOT, MEM_READ = 0x60, 0xF0
 UPDATE_MODE, BOOT_BEGIN, BOOT_DATA, BOOT_END, BOOT_INSTALL, BOOT_STATUS = \
     0x84, 0x85, 0x86, 0x87, 0x88, 0x89
+# Own calibration area (OCD = OWN_CAL_DESIGN.md of the LC1020E repository, section 4)
+OCAL_INFO, OCAL_READ, OCAL_WRITE, OCAL_ROLLBACK = 0x30, 0x31, 0x32, 0x33
+OCAL_LOCK, OCAL_RAW, OCAL_TRACE, MONITOR = 0x34, 0x35, 0x36, 0x37
+OCAL_COMMANDS = tuple(range(0x30, 0x38))
 
 # Events (SL 10)
 EV_KEY, EV_SCREEN_CHANGED, EV_SETTING_CHANGED, EV_POWERED_OFF = 0x90, 0x91, 0x93, 0x94
 EV_MEASURE_DONE, EV_SAVE_RESULT, EV_CALIBRATION = 0x95, 0x96, 0x97
+EV_OCAL_CHANGED = 0x98           # OCD 4.3: active slot u8, sequence u32, flags u32
 EVENT_NAME = {EV_KEY: "KEY", EV_SCREEN_CHANGED: "SCREEN_CHANGED",
               EV_SETTING_CHANGED: "SETTING_CHANGED", EV_POWERED_OFF: "POWERED_OFF",
               EV_MEASURE_DONE: "MEASURE_DONE", EV_SAVE_RESULT: "SAVE_RESULT",
-              EV_CALIBRATION: "CALIBRATION"}
+              EV_CALIBRATION: "CALIBRATION", EV_OCAL_CHANGED: "OCAL_CHANGED"}
 
 # Answer time limits in seconds (SL 4.3: the column "tools/lc1020e.py waits")
 T_FAST = 1.5
@@ -69,7 +80,8 @@ T_SAVE = 4.0
 T_JOB = 23.0
 T_COMPARE_SET = 63.0
 T_DIRECT = 4.0                   # SL 4.3 / 14: the five set commands when CAP_DIRECT_SET is set
-T_CALIBRATE = 126.0
+T_CALIBRATE = 126.0              # SL 4.3: the vendor sweep, job limit 120 000 ms
+T_CALIBRATE_SWEEP = 366.0        # SL 4.3: with CAP_CAL_SWEEP, job limit 360 000 ms
 T_BOOT_BEGIN = 13.0
 T_BOOT_INSTALL = 4.0
 
@@ -80,6 +92,13 @@ CAP_BOOT, CAP_BATTERY, CAP_POWER_OFF, CAP_RESTORE_DEFAULTS, CAP_RECOVERY, CAP_FA
     14, 15, 16, 17, 18, 19
 CAP_SETUP_LANGUAGE = 20          # clear in this firmware: English only (SL 5.6)
 CAP_DIRECT_SET = 21              # SL 4.3 / 14: the five set commands set the value directly, no key job
+CAP_FREQ_60HZ = 22               # LCR_TABLES list 2 "frequency" has a sixth entry, 60 Hz
+CAP_TOLERANCE = 23               # TOLERANCE_SET and the 50-byte COMPARE record
+CAP_MEASURE_MARKER = 24          # MEASURE byte 64 (markers) and save result 9
+CAP_CAL_SWEEP = 25               # SL 5.3.3 / 14: the own calibration sweep: CALIBRATE answers 8 bytes
+                                 # (failed point, reason), waits up to 360 s; the CALIBRATION step is
+                                 # 3 x the points done + the windows held for the point in progress
+CAP_OCAL = 26                    # OCD 4.3 (binding decision: bit 26): OCAL_*, MONITOR, MEASURE byte 65
 
 STATUS_NAME = {0: "OK", 1: "unknown command", 2: "bad length or argument", 3: "not allowed now",
                4: "busy", 5: "storage error", 6: "refused for safety",
@@ -112,7 +131,23 @@ SAVE_FLAGS = {0x01: "saves held", 0x02: "backup differs", 0x04: "no valid copy a
               0x08: "last save failed", 0x10: "copy B loaded (saves write A only)",
               0x20: "copy A damaged", 0x40: "rewrite of A pending", 0x80: "restart pending"}
 SAVE_RESULT = {0: "OK", 1: "held", 2: "refused", 3: "trailer mark failed", 4: "erase failed",
-               5: "program failed", 6: "verify failed", 7: "bad block", 8: "source copy invalid"}
+               5: "program failed", 6: "verify failed", 7: "bad block", 8: "source copy invalid",
+               9: "unchanged: both copies already held the block, nothing written"}
+SAVE_UNCHANGED = 9               # save result 9 (CAP_MEASURE_MARKER); its answer status is 0
+
+# MEASURE byte 64 markers and the COMPARE tail (CAP_MEASURE_MARKER, CAP_TOLERANCE)
+MARK_MAIN, MARK_SECONDARY_UNSPECIFIED = 0x01, 0x02     # bit 0 main value, bit 1 secondary value
+                                                       # outside the manual's accuracy table
+TOLERANCE_MODE_NAME = {0: "vendor +-%", 1: "% limits", 2: "pF limits", 3: "IEC letter"}
+COMPARE_MODE_IN_FORCE_NAME = {0: "vendor symmetric %", 1: "% limits", 2: "pF limits"}
+COMPARE_RESULT_NAME = {0: "---", 1: "IN", 2: "HI", 3: "LO", 4: "secondary limit failed",
+                       5: "OUT of range", 6: "---"}   # 0 no part, 6 not yet stable
+SECONDARY_LIMIT_NAME = {0: "none", 1: "D max", 2: "Q min", 3: "ESR max"}
+TOL_MODE_VENDOR, TOL_MODE_PERCENT, TOL_MODE_PF, TOL_MODE_LETTER = 0, 1, 2, 3
+TOL_PERCENT_RANGE = (-9999, 99990)       # 0.01 % steps
+TOL_PF_RANGE = (-99999, 99999)           # 0.01 pF steps
+TOL_LETTERS = "BCDFGJKMZ"                # IEC 60062
+
 SAVE_STEP = {0: "", 0x01: "check", 0x41: "mark", 0x42: "erase", 0x43: "program", 0x44: "verify"}
 SAVE_COPY = {0: "", 1: "A", 2: "B"}
 FLASH_RESULT = {0: "OK", 1: "outside the writable area", 2: "word not erased",
@@ -168,6 +203,7 @@ COMMANDS: dict[int, Command] = {c.code: c for c in [
     _cmd(MEASURE_STREAM, "MEASURE_STREAM", CAP_MEASURE),
     _cmd(COMPARE, "COMPARE", CAP_COMPARE),
     _cmd(COMPARE_SET, "COMPARE_SET", CAP_COMPARE, T_COMPARE_SET),
+    _cmd(TOLERANCE_SET, "TOLERANCE_SET", CAP_TOLERANCE),    # answered at once: fast timeout
     _cmd(HOLD, "HOLD", CAP_HOLD, T_JOB),
     _cmd(CALIBRATE, "CALIBRATE", CAP_CALIBRATE, T_CALIBRATE, dangerous=True),
     _cmd(SETTINGS_TABLES, "SETTINGS_TABLES", CAP_SETTINGS),
@@ -190,6 +226,14 @@ COMMANDS: dict[int, Command] = {c.code: c for c in [
     _cmd(BOOT_END, "BOOT_END", CAP_BOOT, dangerous=True),
     _cmd(BOOT_INSTALL, "BOOT_INSTALL", CAP_BOOT, T_BOOT_INSTALL, dangerous=True),
     _cmd(BOOT_STATUS, "BOOT_STATUS", CAP_BOOT),
+    _cmd(OCAL_INFO, "OCAL_INFO", CAP_OCAL),                 # OCD 4.1
+    _cmd(OCAL_READ, "OCAL_READ", CAP_OCAL),
+    _cmd(OCAL_WRITE, "OCAL_WRITE", CAP_OCAL, T_SAVE, dangerous=True),     # one commit, up to 1 s
+    _cmd(OCAL_ROLLBACK, "OCAL_ROLLBACK", CAP_OCAL, T_SAVE, dangerous=True),
+    _cmd(OCAL_LOCK, "OCAL_LOCK", CAP_OCAL),                 # RAM only
+    _cmd(OCAL_RAW, "OCAL_RAW", CAP_OCAL),
+    _cmd(OCAL_TRACE, "OCAL_TRACE", CAP_OCAL),
+    _cmd(MONITOR, "MONITOR", CAP_OCAL),
 ]}
 
 
@@ -284,7 +328,8 @@ def parse_value_block(d: bytes, pos: int = 0) -> ValueBlock:
 
 @dataclass
 class Measure:
-    """MEASURE record, 64 bytes (SL 6.2)."""
+    """MEASURE record, 65 bytes (SL 6.2); firmware without CAP_MEASURE_MARKER sends 64 bytes and
+    byte 64 (markers) then reads as 0."""
     result: int
     time: int
     main_row: int
@@ -301,23 +346,53 @@ class Measure:
     speed: int
     circuit: int
     raw: bytes = field(default=b"", repr=False)
-    SIZE = 64
+    markers: int = 0                 # byte 64: bit 0 main value, bit 1 secondary "unspecified"
+    ocal_flags: int | None = None    # byte 65 (CAP_OCAL, OCD 2.8): OCAL_FLAG_*; None = not sent
+    SIZE = 64                        # shortest record accepted
+    SIZE_MARKERS = 65
+    SIZE_OCAL = 66
+
+    @property
+    def gain_applied(self) -> bool:
+        return bool((self.ocal_flags or 0) & OCAL_FLAG_GAIN)
+
+    @property
+    def gain_missing(self) -> bool:
+        """The frequency has GAIN entries but this cell is not calibrated (OCD 2.8 bit 1)."""
+        return bool((self.ocal_flags or 0) & OCAL_FLAG_GAIN_MISSING)
+
+    @property
+    def main_unspecified(self) -> bool:
+        """The main value lies outside the manual's accuracy table (amber on the meter)."""
+        return bool(self.markers & MARK_MAIN)
+
+    @property
+    def secondary_unspecified(self) -> bool:
+        """The secondary value lies outside the manual's accuracy table (amber on the meter)."""
+        return bool(self.markers & MARK_SECONDARY_UNSPECIFIED)
 
 
-def parse_measure(d: bytes) -> Measure:
+def parse_measure(d: bytes, ocal: bool = False) -> Measure:
+    """MEASURE record. `ocal`: the meter has CAP_OCAL, so byte 65 (OCD 2.8) is the OCAL flags
+    byte; it is read only then and only when the record has 66 bytes."""
     _short("MEASURE", d, Measure.SIZE)
     res, t, mrow = struct.unpack_from("<IIB", d, 0)
     main = parse_value_block(d, 9)
     skind = d[24]
     sec = parse_value_block(d, 25)
     par, z, th, fq, lv, bs, rg, sp, ci = struct.unpack_from("<BffIffBBB", d, 40)
+    has_ocal = ocal and len(d) >= Measure.SIZE_OCAL
+    size = Measure.SIZE_OCAL if has_ocal else (
+        Measure.SIZE_MARKERS if len(d) >= Measure.SIZE_MARKERS else Measure.SIZE)
     return Measure(res, t, mrow, main, skind, sec, par, z, th, fq, lv, bs, rg, sp, ci,
-                   bytes(d[:Measure.SIZE]))
+                   bytes(d[:size]), d[64] if size >= Measure.SIZE_MARKERS else 0,
+                   d[65] if has_ocal else None)
 
 
 @dataclass
 class Compare:
-    """COMPARE record, 29 bytes (SL 6.3)."""
+    """COMPARE record, 50 bytes (SL 6.3); 29 bytes on firmware without CAP_TOLERANCE, then the
+    tail fields (from mode_in_force on) are None. `ok` is 1 when `result` is IN."""
     quantity: int
     nominal: float
     tolerance: float
@@ -330,12 +405,33 @@ class Compare:
     warn_sound: int
     warn_led: int
     raw: bytes = field(default=b"", repr=False)
-    SIZE = 29
+    mode_in_force: int | None = None     # 29: 0 vendor symmetric %, 1 % limits, 2 pF limits
+    mode_set: int | None = None          # 30: 0 vendor +-%, 1 % limits, 2 pF limits, 3 IEC letter
+    letter: str | None = None            # 31: ASCII letter of mode 3, "" when none
+    lower: float | None = None           # 32: lower limit in force (% or pF)
+    upper: float | None = None           # 36: upper limit in force (% or pF)
+    result: int | None = None            # 40: COMPARE_RESULT_NAME
+    signed_deviation: float | None = None    # 41: % or pF by mode_in_force
+    secondary_kind: int | None = None    # 45: SECONDARY_LIMIT_NAME
+    secondary_value: float | None = None     # 46
+    SIZE = 29                            # shortest record accepted
+    SIZE_TOLERANCE = 50
+
+    @property
+    def result_name(self) -> str | None:
+        return None if self.result is None else COMPARE_RESULT_NAME.get(self.result,
+                                                                        "?%d" % self.result)
 
 
 def parse_compare(d: bytes) -> Compare:
     _short("COMPARE", d, Compare.SIZE)
-    return Compare(*struct.unpack_from("<BfffBIIfBBB", d), raw=bytes(d[:Compare.SIZE]))
+    head = struct.unpack_from("<BfffBIIfBBB", d)
+    if len(d) < Compare.SIZE_TOLERANCE:
+        return Compare(*head, raw=bytes(d[:Compare.SIZE]))
+    mode_in_force, mode_set, letter, lower, upper, result, dev, kind, value = \
+        struct.unpack_from("<BBBffBfBf", d, 29)
+    return Compare(*head, bytes(d[:Compare.SIZE_TOLERANCE]), mode_in_force, mode_set,
+                   chr(letter) if letter else "", lower, upper, result, dev, kind, value)
 
 
 @dataclass
@@ -384,19 +480,54 @@ def parse_save_answer(status: int, d: bytes, restarts_on_ok: bool = False) -> Sa
     return SaveResult(status, st, flags, restart)
 
 
+# SL 5.3.3, answer byte 7 (CAP_CAL_SWEEP): why the sweep ended without a result
+CAL_REASON = {0: "none", 1: "no acquisition for 1.5 s", 2: "the point's 20-s limit with fewer than 3 windows",
+              3: "an open point below 100 kohm", 4: "the vendor's store check (table written back as it was)",
+              5: "the point's limit with 3 windows that do not agree",
+              6: "ended by a key, the dialog closed or the screen left"}
+CAL_POINTS = 15                  # SL 5.3.3: 100, 120, 1k, 10k, 100k Hz x 0.1, 0.3, 0.6 V
+
+
 @dataclass
 class CalResult:
-    """CALIBRATE answer, 6 bytes (SL 5.3)."""
+    """CALIBRATE answer (SL 5.3): 6 bytes, 8 with CAP_CAL_SWEEP (failed point, reason)."""
     status: int          # answer status
     cal_status: int      # 0 start, 1 busy, 2 finish, 3 fail
     cal_type: int
     save_status: int
+    point: int | None = None     # 0..14 where the sweep ended without a result, 0xFF none; None: 6 bytes
+    reason: int | None = None    # CAL_REASON; None: 6 bytes
+
+    def describe(self) -> str:
+        text = "calibration status %s, type %d, save status 0x%08X" % (
+            CAL_STATUS.get(self.cal_status, self.cal_status), self.cal_type, self.save_status)
+        if self.point is not None and self.point != 0xFF:
+            text += ", ended at point %d/%d: %s" % (self.point + 1, CAL_POINTS,
+                                                     CAL_REASON.get(self.reason, "reason %s" % self.reason))
+        return text
 
 
 def parse_cal_answer(status: int, d: bytes) -> CalResult:
     _short("CALIBRATE", d, 6)
     st, ty, sv = struct.unpack_from("<BBI", d)
+    if len(d) >= 8:
+        return CalResult(status, st, ty, sv, d[6], d[7])
     return CalResult(status, st, ty, sv)
+
+
+def cal_progress(fields: dict, sweep: bool) -> str:
+    """CALIBRATION event text (SL 10): with CAP_CAL_SWEEP the step is 3 x the points done + the
+    windows held for the point in progress (45 at the store); without it the vendor's seconds."""
+    status = CAL_STATUS.get(fields["status"], fields["status"])
+    step = fields["step"]
+    if sweep:
+        if step >= 3 * CAL_POINTS:
+            where = "storing"
+        else:
+            where = "point %d/%d, %d of 3 windows" % (step // 3 + 1, CAL_POINTS, step % 3)
+    else:
+        where = "step %d s" % step
+    return "status %s, %s, type %d" % (status, where, fields["type"])
 
 
 @dataclass
@@ -524,6 +655,9 @@ def parse_event(cmd: int, payload: bytes, seq: int = 0) -> Event:
             fl = dict(save_status=st, flags=flags)
         elif cmd == EV_CALIBRATION:
             fl = dict(status=p[0], step=p[1], type=p[2])
+        elif cmd == EV_OCAL_CHANGED:
+            slot, seq, flags = struct.unpack_from("<BII", p)
+            fl = dict(slot=slot, sequence=seq, flags=flags)
         else:
             fl = dict(payload=bytes(p))
     except (struct.error, IndexError):
@@ -543,6 +677,656 @@ class ScreenshotHeader:
 def parse_screenshot_header(d: bytes) -> ScreenshotHeader:
     _short("SCREENSHOT", d, 6)
     return ScreenshotHeader(*struct.unpack_from("<HHBB", d))
+
+
+# ----------------------------------------------------------------------------------------------
+# Own calibration area (OCD = OWN_CAL_DESIGN.md of the LC1020E repository: 1.2 record, 2.4 value
+# checks, 4 commands). Little-endian, packed.
+# ----------------------------------------------------------------------------------------------
+
+OCAL_BASE = 0x08062000           # OCD 1.2: slot 0 at +0, slot 1 at +0x2000
+OCAL_SLOT_SIZE = 0x2000
+OCAL_FILE_SIZE = 2 * OCAL_SLOT_SIZE      # a .ocal backup file: slot 0 then slot 1 (OCD 6.1)
+OCAL_MAGIC = 0x4C41434F          # "OCAL"
+OCAL_HEADER = 0x40
+OCAL_FORMAT = 1
+OCAL_REVOKE = 0x38               # header: revoke word, 0xFFFFFFFF = in force
+OCAL_CRC_AT = 0x3C               # header: CRC-32 over bytes 0..0x37 then 0x40..length-1
+OCAL_BODY_MIN, OCAL_BODY_MAX = 8, 0x9C0      # OCD 4.1 OCAL_WRITE total
+OCAL_CHUNK_MAX = 502             # OCD 4.1 OCAL_WRITE chunk 1..502
+OCAL_READ_MAX = 256              # OCD 4.1 OCAL_READ length 1..256
+OCAL_NO_SLOT = 0xFF
+OCAL_TRACE_ENTRIES = 32
+OCAL_SOURCE_NAME = re.compile(r"^LC1020E-([0-9A-F]{24})-.+\.ocal$")
+
+# OCAL_INFO flags (OCD 4.2), bit numbers
+OF_ACTIVE, OF_SLOT0_VALID, OF_SLOT1_VALID, OF_NEWER, OF_UID, OF_SECT, OF_RETAKE, OF_LOCK, \
+    OF_XFER, OF_TRACE = range(10)
+OCAL_INFO_FLAGS = ["record active", "slot 0 valid", "slot 1 valid", "newer format present",
+                   "foreign UID present", "section rejected", "retake short/open", "lock",
+                   "transfer open", "trace armed"]
+# MEASURE byte 65 (OCD 2.8)
+OCAL_FLAG_GAIN, OCAL_FLAG_GAIN_MISSING, OCAL_FLAG_LOCK, OCAL_FLAG_RETAKE = 1, 2, 4, 8
+# OCAL_RAW flags byte (OCD 4.1 0x35)
+RAW_SATURATED, RAW_OVERLOAD = 1, 2
+# MONITOR flags (OCD 4.1 0x37)
+MON_V_CALIBRATED, MON_GAIN_APPLIED, MON_NO_READING, MON_LOCK = 1, 2, 4, 8
+# OCAL_TRACE
+TRACE_DISARM, TRACE_ARM, TRACE_READ = 0, 1, 2
+TRACE_STATE_NAME = {0: "idle", 1: "armed", 2: "recording", 3: "full"}
+TRACE_DISCARDED, TRACE_SATURATED = 1, 2
+SETTLE_KIND_NAME = ["restart", "frequency", "level", "bias", "speed", "screen", "range or gain code"]
+
+# Sections (OCD 1.2)
+SEC_META, SEC_GAIN, SEC_CLIP, SEC_SETTLE, SEC_MONITOR, SEC_BIAS = range(6)
+SECTION_NAME = {SEC_META: "META", SEC_GAIN: "GAIN", SEC_CLIP: "CLIP", SEC_SETTLE: "SETTLE",
+                SEC_MONITOR: "MONITOR", SEC_BIAS: "BIAS"}
+OCAL_FREQ = (100, 120, 1000, 10000, 100000, 60)      # frequency index fi 0..5 (OCD 1.2 GAIN)
+GAIN_ENTRY_SIZE = 332            # 12 + 32 x 8 + 8 x 8
+SECTION_SIZE = {SEC_META: 32, SEC_GAIN: 6 * GAIN_ENTRY_SIZE, SEC_CLIP: 64, SEC_SETTLE: 84,
+                SEC_MONITOR: 28, SEC_BIAS: 4}
+GAIN_ENTRY_INDEX = 41            # validation entry index of GAIN as the meter reports it (firmware
+                                 # own/ocal.s ocal_validate_section): 41 * fi + k, k 0..31 zeta,
+                                 # 32..39 nu, 40 the pad halfword
+GAIN_PAD_K = 40
+STRUCTURE_INDEX = 0xFFFF         # entry index the host reports for a structure error
+DEFAULT_SETTLE_MS = (26, 26, 26, 26, 26, 5, 5)       # OCD 1.2 SETTLE defaults per kind
+SETTLE_MIN, SETTLE_MAX = 1, 500
+CLIP_MIN_SPAN = 3600             # OCD 2.4: hi - lo must exceed this
+# the vendor tables the OCD formulas use (OCD 5; meas.s meas_win)
+OCAL_GAIN_CODES = tuple(1 << i for i in range(8))    # G[code], code 0..7
+OCAL_RANGE_OHM = (100, 1000, 10000, 100000)          # R[c8], c8 0..3
+KV_MIN, KV_MAX = struct.unpack("<f", struct.pack("<f", 1e-6))[0], 1.0   # as the meter's f32 constant
+
+
+class OcalValidationError(DeviceError):
+    """A body that the meter would refuse (OCD 2.4): the section id and the entry index the meter
+    would answer in status 2 with 3 data bytes; STRUCTURE_INDEX for the structure of the body."""
+
+    def __init__(self, section: int, index: int, why: str):
+        self.section, self.index, self.why = section, index, why
+        super().__init__("%s: %s" % (ocal_where(section, index), why))
+
+
+def ocal_where(section: int, index: int) -> str:
+    name = SECTION_NAME.get(section, "section %d" % section)
+    return name if index == STRUCTURE_INDEX else "%s entry %d" % (name, index)
+
+
+@dataclass
+class GainFreq:
+    """GAIN entry of one frequency index (OCD 1.2): mask bits (zeta: bit 8 * c8 + c6, nu: bit
+    c5) for magnitude and phase, 32 zeta and 8 nu factors. A factor is used by the meter only
+    when all four bits of its cell are set (OCD 2.1)."""
+    zeta_mag_mask: int = 0
+    zeta_phase_mask: int = 0
+    nu_mag_mask: int = 0
+    nu_phase_mask: int = 0
+    pad: int = 0
+    zeta: list = field(default_factory=lambda: [1 + 0j] * 32)
+    nu: list = field(default_factory=lambda: [1 + 0j] * 8)
+
+    def cell_calibrated(self, c5: int, c6: int, c8: int) -> bool:
+        k = 8 * c8 + c6
+        return bool(self.zeta_mag_mask >> k & 1 and self.zeta_phase_mask >> k & 1
+                    and self.nu_mag_mask >> c5 & 1 and self.nu_phase_mask >> c5 & 1)
+
+    def any_cell(self) -> bool:
+        return any(self.cell_calibrated(c5, c6, c8)
+                   for c8 in range(4) for c6 in range(8) for c5 in range(8))
+
+
+def pack_gain_freq(g: GainFreq) -> bytes:
+    if len(g.zeta) != 32 or len(g.nu) != 8:
+        raise ValueError("GAIN entry: 32 zeta and 8 nu factors")
+    out = struct.pack("<IIBBH", g.zeta_mag_mask, g.zeta_phase_mask, g.nu_mag_mask,
+                      g.nu_phase_mask, g.pad)
+    for z in list(g.zeta) + list(g.nu):
+        out += struct.pack("<ff", complex(z).real, complex(z).imag)
+    return out
+
+
+def unpack_gain_freq(d: bytes) -> GainFreq:
+    if len(d) != GAIN_ENTRY_SIZE:
+        raise DeviceError("GAIN entry of %d bytes, expected %d" % (len(d), GAIN_ENTRY_SIZE))
+    zm, zp, nm, np_, pad = struct.unpack_from("<IIBBH", d)
+    v = struct.unpack_from("<80f", d, 12)
+    z = [complex(v[2 * i], v[2 * i + 1]) for i in range(40)]
+    return GainFreq(zm, zp, nm, np_, pad, z[:32], z[32:])
+
+
+def pack_gain(entries) -> bytes:
+    """The GAIN section body: six entries in the frequency-index order of OCAL_FREQ."""
+    entries = list(entries)
+    if len(entries) != len(OCAL_FREQ):
+        raise ValueError("GAIN: %d entries expected" % len(OCAL_FREQ))
+    return b"".join(pack_gain_freq(g) for g in entries)
+
+
+def unpack_gain(d: bytes) -> list:
+    if len(d) != SECTION_SIZE[SEC_GAIN]:
+        raise DeviceError("GAIN section of %d bytes, expected %d" % (len(d), SECTION_SIZE[SEC_GAIN]))
+    return [unpack_gain_freq(d[i * GAIN_ENTRY_SIZE:(i + 1) * GAIN_ENTRY_SIZE])
+            for i in range(len(OCAL_FREQ))]
+
+
+def pack_clip(clip) -> bytes:
+    """CLIP section body from 16 (lo, hi) pairs: index 8 * channel + gain code, channel 0 = ADC1
+    (V), 1 = ADC2 (I)."""
+    clip = list(clip)
+    if len(clip) != 16:
+        raise ValueError("CLIP: 16 (lo, hi) pairs")
+    return b"".join(struct.pack("<HH", lo, hi) for lo, hi in clip)
+
+
+def unpack_clip(d: bytes) -> list:
+    if len(d) != SECTION_SIZE[SEC_CLIP]:
+        raise DeviceError("CLIP section of %d bytes" % len(d))
+    return [struct.unpack_from("<HH", d, 4 * i) for i in range(16)]
+
+
+def pack_settle(table) -> bytes:
+    """SETTLE section body from 7 rows (kind 0..6) of 6 values (frequency index), milliseconds."""
+    rows = [list(r) for r in table]
+    if len(rows) != 7 or any(len(r) != 6 for r in rows):
+        raise ValueError("SETTLE: 7 kinds x 6 frequencies")
+    return struct.pack("<42H", *[v for r in rows for v in r])
+
+
+def unpack_settle(d: bytes) -> list:
+    if len(d) != SECTION_SIZE[SEC_SETTLE]:
+        raise DeviceError("SETTLE section of %d bytes" % len(d))
+    v = struct.unpack("<42H", d)
+    return [list(v[6 * k:6 * k + 6]) for k in range(7)]
+
+
+def pack_monitor(mask: int, kv) -> bytes:
+    kv = list(kv)
+    if len(kv) != 6:
+        raise ValueError("MONITOR: six kV values")
+    return struct.pack("<I6f", mask, *kv)
+
+
+def unpack_monitor(d: bytes) -> tuple:
+    if len(d) != SECTION_SIZE[SEC_MONITOR]:
+        raise DeviceError("MONITOR section of %d bytes" % len(d))
+    v = struct.unpack("<I6f", d)
+    return v[0], list(v[1:])
+
+
+def pack_bias(limit: int, pad: int = 0) -> bytes:
+    return struct.pack("<HH", limit, pad)
+
+
+def pack_meta(time_s: int, note: str = "") -> bytes:
+    """META section body: host time (Unix seconds) and a note of at most 28 ASCII bytes."""
+    raw = note.encode("ascii", "replace")[:28]
+    return struct.pack("<I28s", int(time_s) & 0xFFFFFFFF, raw)
+
+
+def unpack_meta(d: bytes) -> tuple:
+    if len(d) != SECTION_SIZE[SEC_META]:
+        raise DeviceError("META section of %d bytes" % len(d))
+    t, note = struct.unpack("<I28s", d)
+    return t, note.rstrip(b"\0").decode("ascii", "replace")
+
+
+def check_gain_factor(z: complex) -> str | None:
+    """OCD 2.4 for a factor whose mask bit is set: finite, 0.25 <= re^2 + im^2 <= 4, re > 0 and
+    4 re^2 >= re^2 + im^2 (|arg| <= 60 degrees). None when it passes, else the reason."""
+    re, im = z.real, z.imag
+    if not (math.isfinite(re) and math.isfinite(im)):
+        return "not finite"
+    m2 = re * re + im * im
+    if not 0.25 <= m2 <= 4.0:
+        return "magnitude %.4g outside 0.5 .. 2" % math.sqrt(m2)
+    if not (re > 0 and 4 * re * re >= m2):
+        return "phase beyond 60 degrees"
+    return None
+
+
+def check_gain_entry(g: GainFreq, fi: int = 0) -> tuple[int, str] | None:
+    """OCD 2.4 GAIN rules for one entry -> (entry index, reason) of the first violation, or None."""
+    base = GAIN_ENTRY_INDEX * fi
+    if g.pad != 0:
+        return base + GAIN_PAD_K, "pad is not 0"
+    if g.zeta_mag_mask >> 32 or g.zeta_phase_mask >> 32 or g.nu_mag_mask >> 8 or g.nu_phase_mask >> 8:
+        return base, "mask bit beyond zeta 0..31 / nu 0..7"
+    for k in range(32):
+        if (g.zeta_mag_mask | g.zeta_phase_mask) >> k & 1:
+            why = check_gain_factor(complex(g.zeta[k]))
+            if why:
+                return base + k, "zeta[%d][%d]: %s" % (k // 8, k % 8, why)
+    for c5 in range(8):
+        if (g.nu_mag_mask | g.nu_phase_mask) >> c5 & 1:
+            why = check_gain_factor(complex(g.nu[c5]))
+            if why:
+                return base + 32 + c5, "nu[%d]: %s" % (c5, why)
+    return None
+
+
+def validate_section(sid: int, d: bytes) -> None:
+    """The value rules of OCD 2.4 for one section body; raises OcalValidationError. Unknown ids
+    (a later format's additions) have no value rules; META has none."""
+    want = SECTION_SIZE.get(sid)
+    if want is not None and len(d) != want:
+        raise OcalValidationError(sid, STRUCTURE_INDEX, "length %d, expected %d" % (len(d), want))
+    if sid == SEC_GAIN:
+        for fi, g in enumerate(unpack_gain(d)):
+            bad = check_gain_entry(g, fi)
+            if bad:
+                raise OcalValidationError(sid, bad[0], bad[1])
+    elif sid == SEC_CLIP:
+        for i, (lo, hi) in enumerate(unpack_clip(d)):
+            if hi > 4095 or lo >= hi or hi - lo <= CLIP_MIN_SPAN:
+                raise OcalValidationError(sid, i, "lo %d, hi %d: need hi <= 4095, lo < hi and "
+                                          "hi - lo > %d" % (lo, hi, CLIP_MIN_SPAN))
+    elif sid == SEC_SETTLE:
+        for i, v in enumerate(struct.unpack("<42H", d)):
+            if not SETTLE_MIN <= v <= SETTLE_MAX:
+                raise OcalValidationError(sid, i, "%d ms outside %d .. %d"
+                                          % (v, SETTLE_MIN, SETTLE_MAX))
+    elif sid == SEC_MONITOR:
+        mask, kv = unpack_monitor(d)
+        if mask >> 6:
+            raise OcalValidationError(sid, 0, "mask bit beyond 0..5")
+        for fi in range(6):
+            if mask >> fi & 1 and not (math.isfinite(kv[fi]) and KV_MIN <= kv[fi] <= KV_MAX):
+                raise OcalValidationError(sid, fi, "kV %g outside %g .. %g" % (kv[fi], KV_MIN, KV_MAX))
+    elif sid == SEC_BIAS:
+        limit, pad = struct.unpack("<HH", d)
+        if not 1 <= limit <= 4095 or pad != 0:
+            raise OcalValidationError(sid, 0, "limit %d (1 .. 4095) / pad %d (0)" % (limit, pad))
+
+
+def parse_body(body: bytes) -> dict:
+    """The sections of a record body {id: bytes} (OCD 1.2): {id u16, length u16} + body in
+    strictly ascending ids, every length a multiple of 4 and inside the body. A body that breaks
+    that raises OcalValidationError (the walk the meter does at load stops there instead)."""
+    body = bytes(body)
+    out: dict = {}
+    pos, prev = 0, -1
+    while pos + 4 <= len(body):
+        sid, n = struct.unpack_from("<HH", body, pos)
+        if n % 4:
+            raise OcalValidationError(sid, STRUCTURE_INDEX, "length %d is not a multiple of 4" % n)
+        if pos + 4 + n > len(body):
+            raise OcalValidationError(sid, STRUCTURE_INDEX, "runs past the end of the body")
+        if sid <= prev:
+            raise OcalValidationError(sid, STRUCTURE_INDEX, "ids are not strictly ascending")
+        out[sid] = body[pos + 4:pos + 4 + n]
+        prev, pos = sid, pos + 4 + n
+    if pos != len(body):
+        raise OcalValidationError(prev if prev >= 0 else 0, STRUCTURE_INDEX,
+                                  "%d bytes after the last section" % (len(body) - pos))
+    return out
+
+
+def build_body(sections: dict, validate: bool = True) -> bytes:
+    """A record body from {id: section bytes}, ids ascending (OCD 1.2). With `validate` the
+    structure and the value rules of OCD 2.4 are checked here, as the meter does: body length
+    8 .. 0x9C0 (multiple of 4), known ids with exactly their length."""
+    out = bytearray()
+    for sid in sorted(sections):
+        data = bytes(sections[sid])
+        if not 0 <= sid <= 0xFFFF or len(data) % 4 or len(data) > 0xFFFF:
+            raise OcalValidationError(sid, STRUCTURE_INDEX, "length %d is not a multiple of 4" % len(data))
+        if validate:
+            validate_section(sid, data)
+        out += struct.pack("<HH", sid, len(data)) + data
+    if validate and not OCAL_BODY_MIN <= len(out) <= OCAL_BODY_MAX:
+        raise OcalValidationError(0, STRUCTURE_INDEX, "body of %d bytes, allowed %d .. %d"
+                                  % (len(out), OCAL_BODY_MIN, OCAL_BODY_MAX))
+    return bytes(out)
+
+
+def validate_body(body: bytes) -> dict:
+    """parse_body and the value rules for every section; returns the sections."""
+    body = bytes(body)
+    if len(body) % 4 or not OCAL_BODY_MIN <= len(body) <= OCAL_BODY_MAX:
+        raise OcalValidationError(0, STRUCTURE_INDEX, "body of %d bytes: multiple of 4, %d .. %d"
+                                  % (len(body), OCAL_BODY_MIN, OCAL_BODY_MAX))
+    sections = parse_body(body)
+    for sid, data in sections.items():
+        validate_section(sid, data)
+    return sections
+
+
+@dataclass
+class OcalRecord:
+    """One slot read as a record (OCD 1.2 header, 1.3 step 1). `valid` = CRC-valid: magic, header
+    size, length, sequence and CRC-32 all right."""
+    slot: int
+    valid: bool
+    why: str
+    format: int = 0
+    length: int = 0
+    sequence: int = 0
+    uid: bytes = b""
+    shopen_crc: int = 0
+    revoked: bool = False
+    raw: bytes = field(default=b"", repr=False)
+
+    @property
+    def body(self) -> bytes:
+        return self.raw[OCAL_HEADER:self.length]
+
+    def own(self, uid: bytes) -> bool:
+        return self.valid and self.uid == bytes(uid)
+
+    def in_force(self, uid: bytes) -> bool:
+        return self.own(uid) and not self.revoked
+
+    def describe(self) -> str:
+        if not self.valid:
+            return "slot %d: no record (%s)" % (self.slot, self.why)
+        return "slot %d: format %d, sequence %d, %d bytes, UID %s%s" % (
+            self.slot, self.format, self.sequence, self.length, self.uid.hex().upper(),
+            ", revoked" if self.revoked else "")
+
+
+def ocal_record_crc(rec: bytes, length: int) -> int:
+    """CRC-32 of bytes 0..0x37 followed by bytes 0x40..length-1 (OCD 1.2, the word at +0x3C)."""
+    return crc32(bytes(rec[:OCAL_REVOKE]) + bytes(rec[OCAL_HEADER:length]))
+
+
+def parse_ocal_record(slot_bytes: bytes, slot: int = 0) -> OcalRecord:
+    """The record at the start of one slot's bytes (OCD 1.3 step 1)."""
+    d = bytes(slot_bytes)
+    if len(d) < OCAL_HEADER:
+        return OcalRecord(slot, False, "fewer than %d bytes" % OCAL_HEADER)
+    magic, fmt, hsize, length, seq = struct.unpack_from("<IHHII", d)
+    if magic != OCAL_MAGIC:
+        return OcalRecord(slot, False, "no magic")
+    if hsize != OCAL_HEADER:
+        return OcalRecord(slot, False, "header size %d" % hsize)
+    if not OCAL_HEADER <= length <= OCAL_SLOT_SIZE or length % 4 or length > len(d):
+        return OcalRecord(slot, False, "length %d" % length)
+    if seq in (0, 0xFFFFFFFF):
+        return OcalRecord(slot, False, "sequence 0x%08X" % seq)
+    (stored,) = struct.unpack_from("<I", d, OCAL_CRC_AT)
+    if ocal_record_crc(d, length) != stored:
+        return OcalRecord(slot, False, "CRC-32 mismatch")
+    (shopen,) = struct.unpack_from("<I", d, 0x1C)
+    (revoke,) = struct.unpack_from("<I", d, OCAL_REVOKE)
+    return OcalRecord(slot, True, "ok", fmt, length, seq, d[0x10:0x1C], shopen,
+                      revoke != 0xFFFFFFFF, d[:length])
+
+
+def parse_ocal_file(data: bytes) -> list:
+    """The two records of a .ocal backup file / of both slots read (0x4000 bytes)."""
+    if len(data) != OCAL_FILE_SIZE:
+        raise DeviceError("OCAL image of %d bytes, expected %d" % (len(data), OCAL_FILE_SIZE))
+    return [parse_ocal_record(data[i * OCAL_SLOT_SIZE:(i + 1) * OCAL_SLOT_SIZE], i) for i in range(2)]
+
+
+def ocal_active_record(records, uid: bytes) -> OcalRecord | None:
+    """The active record by OCD 1.3 steps 2 and 3: among own records in force the higher
+    sequence (slot 0 on a tie); None when its format is not 1 (the meter sets OF_NEWER)."""
+    cand = [r for r in records if r.in_force(uid)]
+    if not cand:
+        return None
+    best = cand[0]
+    for r in cand[1:]:
+        if r.sequence > best.sequence:
+            best = r
+    return best if best.format == OCAL_FORMAT else None
+
+
+@dataclass
+class OcalInfo:
+    """OCAL_INFO, 64 bytes (OCD 4.2)."""
+    flags: int
+    active_slot: int
+    format: int
+    active_length: int
+    active_sequence: int
+    other_sequence: int
+    active_crc: int
+    sections_present: int
+    gain_frequencies: int
+    monitor_frequencies: int
+    sections_rejected: int
+    t_max: int
+    meta_time: int
+    meta_note: str
+    raw: bytes = field(default=b"", repr=False)
+    SIZE = 64
+
+    def flag(self, bit: int) -> bool:
+        return bool(self.flags >> bit & 1)
+
+    @property
+    def active(self) -> bool:
+        return self.flag(OF_ACTIVE) and self.active_slot != OCAL_NO_SLOT
+
+    def has_section(self, sid: int) -> bool:
+        return bool(self.sections_present >> sid & 1)
+
+    def gain_hz(self) -> list:
+        return [OCAL_FREQ[i] for i in range(6) if self.gain_frequencies >> i & 1]
+
+    def monitor_hz(self) -> list:
+        return [OCAL_FREQ[i] for i in range(6) if self.monitor_frequencies >> i & 1]
+
+    def rejected_names(self) -> list:
+        return [SECTION_NAME.get(i, "section %d" % i) for i in range(8)
+                if self.sections_rejected >> i & 1]
+
+    def describe(self) -> str:
+        parts = ["flags 0x%04X: %s" % (self.flags, ", ".join(flag_names(self.flags, OCAL_INFO_FLAGS))
+                                       or "none")]
+        if self.active:
+            parts.append("active slot %d, format %d, %d bytes, sequence %d, CRC-32 0x%08X"
+                         % (self.active_slot, self.format, self.active_length,
+                            self.active_sequence, self.active_crc))
+        else:
+            parts.append("no active record")
+        parts.append("other slot sequence %d" % self.other_sequence)
+        return "; ".join(parts)
+
+
+def parse_ocal_info(d: bytes) -> OcalInfo:
+    _short("OCAL_INFO", d, OcalInfo.SIZE)
+    (flags, slot, fmt, length, seq, other, crc, present, gain, mon, rej, tmax, _pad, mtime,
+     note) = struct.unpack_from("<IBBHIIIBBBBHHI28s", d)
+    return OcalInfo(flags, slot, fmt, length, seq, other, crc, present, gain, mon, rej, tmax,
+                    mtime, note.rstrip(b"\0").decode("ascii", "replace"),
+                    bytes(d[:OcalInfo.SIZE]))
+
+
+@dataclass
+class OcalRaw:
+    """OCAL_RAW record of the last closed window, 64 bytes (OCD 2.2, 4.1 0x35)."""
+    window: int
+    c5: int
+    c6: int
+    c8: int
+    lock: int
+    frequency: int
+    level: float
+    bias: float
+    n: int
+    cls: int
+    flags: int
+    z_re: float
+    z_im: float
+    a_v: float
+    a_i: float
+    sigma2_v: float
+    sigma2_i: float
+    max1: int
+    min1: int
+    mid1: int
+    max2: int
+    min2: int
+    mid2: int
+    raw: bytes = field(default=b"", repr=False)
+    SIZE = 64
+
+    @property
+    def cell(self) -> tuple:
+        return (self.c5, self.c6, self.c8)
+
+    @property
+    def locked(self) -> bool:
+        return bool(self.lock)
+
+    @property
+    def saturated(self) -> bool:
+        return bool(self.flags & RAW_SATURATED)
+
+    @property
+    def overload(self) -> bool:
+        return bool(self.flags & RAW_OVERLOAD)
+
+    @property
+    def znom(self) -> complex:
+        return complex(self.z_re, self.z_im)
+
+    def variance(self) -> float:
+        """Variance of log Znom (real and imaginary part alike) from the window's statistics: a
+        DFT over 128 samples of noise sigma^2 has component variance sigma^2 / 64 per
+        acquisition, so relative to the peak amplitudes A_V, A_I in counts (OCD 2.2) the variance
+        of one part of log Z is (sigma2_v / A_v^2 + sigma2_i / A_i^2) / (64 N)."""
+        if self.a_v <= 0 or self.a_i <= 0 or self.n <= 0:
+            return math.inf
+        return (self.sigma2_v / self.a_v ** 2 + self.sigma2_i / self.a_i ** 2) / (64.0 * self.n)
+
+
+def parse_ocal_raw(d: bytes) -> OcalRaw:
+    _short("OCAL_RAW", d, OcalRaw.SIZE)
+    v = struct.unpack_from("<IBBBBIffHBBffffffHHHHHH", d)
+    return OcalRaw(*v, raw=bytes(d[:OcalRaw.SIZE]))
+
+
+@dataclass
+class TraceEntry:
+    tick: int
+    z_re: float
+    z_im: float
+    flags: int
+    c5: int
+    c6: int
+    c8: int
+
+    @property
+    def z(self) -> complex:
+        return complex(self.z_re, self.z_im)
+
+    @property
+    def discarded(self) -> bool:
+        return bool(self.flags & TRACE_DISCARDED)
+
+    @property
+    def saturated(self) -> bool:
+        return bool(self.flags & TRACE_SATURATED)
+
+
+@dataclass
+class OcalTrace:
+    """OCAL_TRACE read answer (OCD 4.1 0x36): `count` entries are recorded, `entries` the ones
+    this answer (or both reads of ocal_trace_read_all) carries."""
+    state: int
+    kind: int
+    change_tick: int
+    count: int
+    entries: list
+    SIZE = 8
+
+    @property
+    def state_name(self) -> str:
+        return TRACE_STATE_NAME.get(self.state, "?%d" % self.state)
+
+
+def parse_ocal_trace(d: bytes) -> OcalTrace:
+    _short("OCAL_TRACE", d, OcalTrace.SIZE)
+    state, kind, tick, count, n = struct.unpack_from("<BBIBB", d)
+    if len(d) < OcalTrace.SIZE + 16 * n:
+        raise DeviceError("OCAL_TRACE answer of %d bytes for %d entries" % (len(d), n))
+    entries = [TraceEntry(*struct.unpack_from("<IffBBBB", d, OcalTrace.SIZE + 16 * i))
+               for i in range(n)]
+    return OcalTrace(state, kind, tick, count, entries)
+
+
+@dataclass
+class Monitor:
+    """MONITOR answer, 25 bytes (OCD 4.1 0x37, 5). v_rms / i_rms are NaN without a calibration,
+    without a reading or on overload."""
+    v_rms: float
+    i_rms: float
+    a_v_ref: float
+    a_i_ref: float
+    flags: int
+    mid1: int
+    mid2: int
+    window: int
+    SIZE = 25
+
+    @property
+    def v_calibrated(self) -> bool:
+        return bool(self.flags & MON_V_CALIBRATED)
+
+    @property
+    def gain_applied(self) -> bool:
+        return bool(self.flags & MON_GAIN_APPLIED)
+
+    @property
+    def no_reading(self) -> bool:
+        return bool(self.flags & MON_NO_READING)
+
+    @property
+    def lock(self) -> bool:
+        return bool(self.flags & MON_LOCK)
+
+
+def parse_monitor(d: bytes) -> Monitor:
+    _short("MONITOR", d, Monitor.SIZE)
+    return Monitor(*struct.unpack_from("<ffffBHHI", d))
+
+
+def monitor_kv(v_dmm: float, a_v: float, c5: int, nu_mag: float = 1.0) -> float:
+    """kV = V_dmm * G[c5] / (A_V * |nu|) (OCD 5 Calibration): V rms per count of peak amplitude
+    referred to V gain 1. nu_mag is |nu[fi][c5]| when the gain is applied at the cell, else 1."""
+    if not 0 <= c5 < 8:
+        raise ValueError("c5 0..7")
+    if not (math.isfinite(v_dmm) and v_dmm > 0 and math.isfinite(a_v) and a_v > 0
+            and math.isfinite(nu_mag) and nu_mag > 0):
+        raise ValueError("V_dmm, A_V and |nu| must be finite and above 0")
+    return v_dmm * OCAL_GAIN_CODES[c5] / (a_v * nu_mag)
+
+
+@dataclass
+class OcalWriteResult:
+    """Last OCAL_WRITE answer (status 0) or the data of its status 5 answer."""
+    result: int
+    slot: int
+    sequence: int
+
+    @property
+    def ok(self) -> bool:
+        return self.result == 0
+
+    def describe(self) -> str:
+        return "commit %s, slot %d, sequence %d" % (FLASH_RESULT.get(self.result, self.result),
+                                                    self.slot, self.sequence)
+
+
+@dataclass
+class OcalRollbackResult:
+    slot: int
+    sequence: int
+    flags: int
+
+    @property
+    def active(self) -> bool:
+        return self.slot != OCAL_NO_SLOT
+
+    def describe(self) -> str:
+        if not self.active:
+            return "no record active (flags 0x%04X)" % self.flags
+        return "record in slot %d, sequence %d, flags 0x%04X active" % (self.slot, self.sequence,
+                                                                          self.flags)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -578,6 +1362,9 @@ def measure_to_reading(m: Measure, t: float, wall: float) -> Reading:
            m.frequency, round(m.level, 4), round(m.bias, 4), m.range, m.circuit, m.parallel)
     main = _block_reading(main_q, m.main, t, wall, m.time, key)
     main.secondary = _block_reading(sec_q, m.secondary, t, wall, m.time, key + ("secondary",))
+    main.unspecified = m.main_unspecified
+    main.secondary.unspecified = m.secondary_unspecified
+    main.gain_flags = m.ocal_flags
     return main
 
 
@@ -752,6 +1539,8 @@ class LC1020E(Device):
         if code in (SCREEN, LCR_SET, HOLD, SETTINGS_SET, COMPARE_SET) \
                 and self.info.has(CAP_DIRECT_SET):        # SL 4.3 / 14: direct set, no key job
             return T_DIRECT
+        if code == CALIBRATE and self.info.has(CAP_CAL_SWEEP):   # SL 4.3: 360 000 ms in the meter
+            return T_CALIBRATE_SWEEP
         return super().timeout_for(code, payload)
 
     # -- live ---------------------------------------------------------------------------------
@@ -785,10 +1574,14 @@ class LC1020E(Device):
     def live(self) -> bool:
         return self._live
 
+    def _parse_measure(self, d: bytes) -> Measure:
+        """MEASURE record of this meter: byte 65 is parsed only with CAP_OCAL (OCD 2.8)."""
+        return parse_measure(d, self.info.has(CAP_OCAL))
+
     def _on_stream(self, frame) -> None:
         try:
             if frame.cmd == MEASURE:
-                self.reading.emit(measure_to_reading(parse_measure(frame.payload), frame.t,
+                self.reading.emit(measure_to_reading(self._parse_measure(frame.payload), frame.t,
                                                      time.time()))
             elif frame.cmd == STATE:
                 self.state.emit(parse_state(frame.payload))
@@ -891,10 +1684,10 @@ class LC1020E(Device):
         return parse_lcr_list(self.call(LCR_TABLES, bytes([list_id])))
 
     def lcr_set(self, setting: int, index: int) -> Measure:
-        return self._rec(LCR_SET, bytes([setting, index]), parse_measure)
+        return self._rec(LCR_SET, bytes([setting, index]), self._parse_measure)
 
     def measure(self) -> Measure:
-        return parse_measure(self.call(MEASURE))
+        return self._parse_measure(self.call(MEASURE))
 
     def measure_reading(self) -> Reading:
         """One single MEASURE as a Reading."""
@@ -913,6 +1706,36 @@ class LC1020E(Device):
         """SL 5.3.1 limits are checked by the meter (status 2)."""
         return self._rec(COMPARE_SET, struct.pack("<ffBBB", nominal, tolerance, warn_type,
                                                   warn_sound, warn_led), parse_compare)
+
+    def tolerance_set(self, mode: int, lower: int = 0, upper: int = 0, letter: str = "",
+                      secondary_kind: int = 0, secondary_value: float = 0.0) -> Compare:
+        """TOLERANCE_SET (CAP_TOLERANCE), answered at once. mode 0 vendor +-% of COMPARE_SET's
+        tolerance; 1 lower / upper in 0.01 % (-9999 .. 99990); 2 lower / upper in 0.01 pF
+        (-99999 .. 99999, compare quantity C only, else status 3); 3 IEC 60062 `letter` (one of
+        B C D F G J K M Z). Secondary limit kind 0 none, 1 D max, 2 Q min, 3 ESR max with a finite
+        value >= 0. Arguments the meter refuses answer status 2 with the record (.record). RAM
+        only; a later change of the meter's tolerance returns the mode to 0."""
+        if mode not in TOLERANCE_MODE_NAME:
+            raise ValueError("tolerance mode %r is not 0..3" % (mode,))
+        if mode in (TOL_MODE_PERCENT, TOL_MODE_PF):
+            lo_max = TOL_PERCENT_RANGE if mode == TOL_MODE_PERCENT else TOL_PF_RANGE
+            if not lo_max[0] <= lower <= upper <= lo_max[1]:
+                raise ValueError("limits %r .. %r outside %d .. %d or lower > upper"
+                                 % (lower, upper, lo_max[0], lo_max[1]))
+        else:
+            lower = upper = 0
+        if mode == TOL_MODE_LETTER:
+            if len(letter) != 1 or letter not in TOL_LETTERS:
+                raise ValueError("tolerance letter %r is not one of %s" % (letter, TOL_LETTERS))
+        else:
+            letter = ""
+        if secondary_kind not in SECONDARY_LIMIT_NAME:
+            raise ValueError("secondary limit kind %r is not 0..3" % (secondary_kind,))
+        if not math.isfinite(secondary_value) or secondary_value < 0:
+            raise ValueError("secondary limit value %r is not finite and >= 0" % (secondary_value,))
+        payload = struct.pack("<BiiBBf", mode, lower, upper, ord(letter) if letter else 0,
+                              secondary_kind, secondary_value)
+        return self._rec(TOLERANCE_SET, payload, parse_compare)
 
     def hold(self, on: bool) -> State:
         return self._rec(HOLD, bytes([1 if on else 0]), parse_state)
@@ -1192,6 +2015,309 @@ class LC1020E(Device):
             raise BackupMismatch("copy %s of the backup is not valid: %s" % (copy, why))
         self._backup_before()
         return self._write_block(chosen["data"][:BLOCK_SIZE])
+
+    # -- own calibration area (OCD 1, 4, 6.1) -------------------------------------------------
+    @contextmanager
+    def ocal_session(self):
+        """The port held for a run of OCAL requests (the stream stopped and started again after),
+        for the host procedures that send many (OCD 3.3)."""
+        with self._job() as job:
+            yield job
+
+    def ocal_info(self) -> OcalInfo:
+        return parse_ocal_info(self.call(OCAL_INFO))
+
+    def ocal_read(self, slot: int, offset: int, length: int) -> bytes:
+        """OCD 4.1: slot 0 / 1, length 1..256, offset + length <= 0x2000; the bytes as they are in
+        flash."""
+        if slot not in (0, 1) or not 1 <= length <= OCAL_READ_MAX or offset < 0 or \
+                offset + length > OCAL_SLOT_SIZE:
+            raise ValueError("OCAL_READ: slot 0/1, length 1..256, offset + length <= 0x2000")
+        data = self.call(OCAL_READ, struct.pack("<BHH", slot, offset, length))
+        if len(data) != length:
+            raise DeviceError("OCAL_READ: %d bytes, expected %d" % (len(data), length))
+        return data
+
+    def ocal_read_slot(self, slot: int, length: int = OCAL_SLOT_SIZE) -> bytes:
+        """The first `length` bytes of one slot in requests of 256 bytes (a cancel point before
+        each)."""
+        out = bytearray()
+        for off in range(0, length, OCAL_READ_MAX):
+            self._cancel_point()
+            out += self.ocal_read(slot, off, min(OCAL_READ_MAX, length - off))
+        return bytes(out)
+
+    def ocal_read_slots(self) -> bytes:
+        """Both slots, 2 x 32 requests of 256 bytes: 0x4000 bytes, slot 0 then slot 1 (OCD 6.1)."""
+        return self.ocal_read_slot(0) + self.ocal_read_slot(1)
+
+    def ocal_records(self) -> list:
+        """Both slots read and parsed as records."""
+        with self._job(), self._cancellable():
+            return parse_ocal_file(self.ocal_read_slots())
+
+    def ocal_backup(self, folder: Path) -> Path:
+        """Both area slots (OCD 6.1) into folder/LC1020E-<UID>/LC1020E-<UID>-<date>.ocal, next to
+        the settings backup: the 0x4000 bytes of slot 0 and slot 1. The UID is in the file name
+        and in the header of every record the file holds. When the newest .ocal file of this
+        UID holds the same bytes no file is written and that file is returned. Cancellable between
+        the requests (nothing is written then)."""
+        out_dir = self.backup_dir(folder)
+        with self._job(), self._cancellable():
+            self._check_same_meter()
+            data = self.ocal_read_slots()
+        newest = self._newest_ocal(out_dir)
+        if newest is not None and newest[1] == data:
+            return newest[0]
+        stamp = self._now().strftime("%Y%m%d-%H%M%S")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = "%s-%s-%s" % (MODEL, self.info.uid_hex, stamp)
+        path = out_dir / (stem + ".ocal")
+        n = 1
+        while path.exists():
+            n += 1
+            path = out_dir / ("%s-%d.ocal" % (stem, n))
+        tmp = path.with_suffix(".ocal.tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return path
+
+    @staticmethod
+    def load_ocal_file(path: Path, uid_hex: str | None = None) -> bytes:
+        """The 0x4000 bytes of a .ocal backup. With `uid_hex` the UID in the file name must be that
+        one (BackupMismatch otherwise); a file of the wrong size is refused."""
+        path = Path(path)
+        m = OCAL_SOURCE_NAME.match(path.name)
+        if m is None:
+            raise BackupMismatch("%s: not a LC1020E-<UID>-<date>.ocal file" % path.name)
+        if uid_hex is not None and m.group(1) != uid_hex:
+            raise BackupMismatch("the file is of meter %s, this meter is %s: refused"
+                                 % (m.group(1), uid_hex))
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            raise BackupMismatch("%s: unreadable (%s)" % (path, e)) from e
+        if len(data) != OCAL_FILE_SIZE:
+            raise BackupMismatch("%s: %d bytes, expected %d" % (path.name, len(data), OCAL_FILE_SIZE))
+        return data
+
+    def _newest_ocal(self, out_dir: Path):
+        """(path, bytes) of the newest readable .ocal file of this UID, or None."""
+        if not out_dir.is_dir():
+            return None
+        for path in sorted(out_dir.glob("*.ocal"), key=lambda p: p.name, reverse=True):
+            try:
+                return path, self.load_ocal_file(path, self.info.uid_hex)
+            except BackupMismatch:
+                continue
+        return None
+
+    def list_ocal_backups(self, folder: Path) -> list:
+        """The .ocal files of this meter, newest first."""
+        out_dir = self.backup_dir(folder)
+        if not out_dir.is_dir():
+            return []
+        return sorted(out_dir.glob("*.ocal"), key=lambda p: p.name, reverse=True)
+
+    def _ocal_backup_before(self) -> Path:
+        """The backup every OCAL write path makes first (OCD 6.1)."""
+        if self.backup_folder is None:
+            raise SafetyRefused("no backup folder is set: nothing is sent without a backup")
+        return self.ocal_backup(self.backup_folder)
+
+    @staticmethod
+    def _describe_ocal_error(e: StatusError) -> None:
+        """OCAL_WRITE status 2 with 3 data bytes is a validation failure (section id u8, entry
+        index u16), status 5 carries the commit result (OCD 4.1)."""
+        if e.status == 2 and len(e.data) == 3:
+            sid, idx = struct.unpack("<BH", e.data)
+            e.detail = "the meter refused the values: %s" % ocal_where(sid, idx)
+        elif e.status == 5 and len(e.data) >= 6:
+            e.record = OcalWriteResult(*struct.unpack_from("<BBI", e.data))
+
+    def ocal_write(self, body: bytes, confirm: str, chunk: int = OCAL_CHUNK_MAX) -> OcalWriteResult:
+        """OCAL_WRITE of a whole record body (OCD 1.2, 4.1): checked on the host with the rules
+        of OCD 2.4 (OcalValidationError before anything is sent), the .ocal backup of both slots
+        first, then chunks of `chunk` bytes with the CRC-32 of the whole body. Status 7 repeats
+        the transfer from offset 0 (as SL 9.4). Returns the commit result, active slot and
+        sequence; a commit result other than 0 raises DeviceError."""
+        self._need_confirm(confirm)
+        if not 1 <= chunk <= OCAL_CHUNK_MAX:
+            raise ValueError("chunk 1..502 bytes")
+        body = bytes(body)
+        validate_body(body)
+        self._ocal_backup_before()
+        crc = crc32(body)
+        for attempt in range(WRITE_BLOCK_RETRIES):
+            try:
+                return self._ocal_write_once(body, chunk, crc)
+            except StatusError as e:
+                if e.status != 7 or attempt == WRITE_BLOCK_RETRIES - 1:
+                    raise
+        raise AssertionError("unreachable")        # the loop returns or raises
+
+    def _ocal_write_once(self, body: bytes, chunk: int, crc: int) -> OcalWriteResult:
+        total, off = len(body), 0
+        with self._job():
+            while True:
+                part = body[off:off + chunk]
+                head = struct.pack("<HHHI", CONFIRM_OK, off, total, crc)
+                try:
+                    data = self.call(OCAL_WRITE, head + part, allow_dangerous=True)
+                except StatusError as e:
+                    self._describe_ocal_error(e)
+                    raise
+                if off + len(part) < total:
+                    _short("OCAL_WRITE", data, 2)
+                    (got,) = struct.unpack_from("<H", data)
+                    if got != off + len(part):
+                        raise DeviceError("OCAL_WRITE: meter expects offset %d, sent %d"
+                                          % (got, off + len(part)))
+                    off = got
+                    continue
+                _short("OCAL_WRITE", data, 6)
+                res = OcalWriteResult(*struct.unpack_from("<BBI", data))
+                if not res.ok:
+                    raise DeviceError("OCAL_WRITE: %s" % res.describe())
+                return res
+
+    def ocal_rollback(self, mode: int, confirm: str) -> OcalRollbackResult:
+        """OCAL_ROLLBACK (OCD 1.5): mode 0 revokes the active record, mode 1 every own format-1
+        record in force. Status 3 when no record qualifies. The .ocal backup first."""
+        self._need_confirm(confirm)
+        if mode not in (0, 1):
+            raise ValueError("rollback mode 0 or 1")
+        self._ocal_backup_before()
+        with self._job():
+            try:
+                data = self.call(OCAL_ROLLBACK, struct.pack("<HB", CONFIRM_OK, mode),
+                                 allow_dangerous=True)
+            except StatusError as e:
+                if e.status == 5 and len(e.data) >= 6:
+                    e.record = OcalWriteResult(*struct.unpack_from("<BBI", e.data))
+                raise
+        _short("OCAL_ROLLBACK", data, 9)
+        return OcalRollbackResult(*struct.unpack_from("<BII", data))
+
+    def ocal_restore(self, path: Path, slot: int, confirm: str) -> OcalWriteResult:
+        """Restores the record of one slot of a .ocal file of THIS meter (OCD 6.1): its body goes
+        through OCAL_WRITE, so the meter gives it a new sequence and checks it (OCD 2.4). The
+        UID in the file name and in the record header must be this meter's, the record must be
+        CRC-valid and of format 1; the current slots are backed up first."""
+        self._need_confirm(confirm)
+        if slot not in (0, 1):
+            raise ValueError("slot 0 or 1")
+        data = self.load_ocal_file(path, self.info.uid_hex)
+        rec = parse_ocal_file(data)[slot]
+        if not rec.valid:
+            raise BackupMismatch("slot %d of %s holds no valid record (%s)" % (slot, Path(path).name,
+                                                                                rec.why))
+        if rec.uid != self.info.uid:
+            raise BackupMismatch("the record in slot %d carries UID %s, this meter is %s: refused"
+                                 % (slot, rec.uid.hex().upper(), self.info.uid_hex))
+        if rec.format != OCAL_FORMAT:
+            raise BackupMismatch("the record in slot %d has format %d; only format %d is restored"
+                                 % (slot, rec.format, OCAL_FORMAT))
+        return self.ocal_write(rec.body, confirm)
+
+    def ocal_active_sections(self) -> tuple:
+        """(OcalInfo, {section id: bytes}) of the active record, read from the meter and checked
+        (CRC-32, UID, format). Without an active record the dict is empty."""
+        with self._job():
+            info = self.ocal_info()
+            if not info.active:
+                return info, {}
+            if info.active_slot not in (0, 1) or not OCAL_HEADER <= info.active_length <= OCAL_SLOT_SIZE:
+                raise DeviceError("OCAL_INFO names slot %d, length %d" % (info.active_slot,
+                                                                         info.active_length))
+            raw = self.ocal_read_slot(info.active_slot, info.active_length)
+        rec = parse_ocal_record(raw, info.active_slot)
+        if not rec.valid or rec.uid != self.info.uid or rec.sequence != info.active_sequence:
+            raise DeviceError("the active record read back does not match OCAL_INFO (%s)" % rec.why)
+        return info, parse_body(rec.body)
+
+    def ocal_update_sections(self, changes: dict, confirm: str,
+                             note: str | None = None) -> OcalWriteResult:
+        """Writes the active record with `changes` {section id: bytes, or None to drop it}
+        applied; every other section is kept. With `note` META is renewed (host time, note)."""
+        self._need_confirm(confirm)
+        _info, sections = self.ocal_active_sections()
+        for sid, data in changes.items():
+            if data is None:
+                sections.pop(sid, None)
+            else:
+                sections[sid] = bytes(data)
+        if note is not None:
+            sections[SEC_META] = pack_meta(int(self._now().timestamp()), note)
+        return self.ocal_write(build_body(sections), confirm)
+
+    def ocal_lock(self, c5: int, c6: int, c8: int) -> OcalRaw:
+        """OCAL_LOCK (OCD 2.2): fixes the gain codes c5 (V, 0..7), c6 (I, 0..7) and the range
+        code c8 (0..3); the answer is the raw record of the last window. RAM only."""
+        if not (0 <= c5 <= 7 and 0 <= c6 <= 7 and 0 <= c8 <= 3):
+            raise ValueError("lock codes: c5 0..7, c6 0..7, c8 0..3")
+        return parse_ocal_raw(self.call(OCAL_LOCK, bytes([c5, c6, c8])))
+
+    def ocal_release(self) -> OcalRaw:
+        """OCAL_LOCK 0xFF 0xFF 0xFF: autoranging again."""
+        return parse_ocal_raw(self.call(OCAL_LOCK, b"\xFF\xFF\xFF"))
+
+    def ocal_raw(self) -> OcalRaw:
+        return parse_ocal_raw(self.call(OCAL_RAW))
+
+    def ocal_wait_window(self, after: int, count: int = 2, timeout: float = 30.0) -> OcalRaw:
+        """Polls OCAL_RAW until the window number is at least after + count (the window closed
+        after a change of codes, frequency or level is the second one: OCD 3.3 step 2) and returns
+        that record. OCAL_RAW also keeps a lock alive (OCD 2.2: 30 s). DeviceError after
+        `timeout` seconds."""
+        deadline = self._clock() + timeout
+        while True:
+            raw = self.ocal_raw()
+            if raw.window >= after + count:
+                return raw
+            if self._clock() > deadline:
+                raise DeviceError("no window closed within %.0f s (window %d, wanted %d)"
+                                  % (timeout, raw.window, after + count))
+            self._sleep(0.1)
+
+    def ocal_trace_arm(self) -> OcalTrace:
+        return parse_ocal_trace(self.call(OCAL_TRACE, bytes([TRACE_ARM, 0])))
+
+    def ocal_trace_disarm(self) -> OcalTrace:
+        return parse_ocal_trace(self.call(OCAL_TRACE, bytes([TRACE_DISARM, 0])))
+
+    def ocal_trace_read(self, start: int = 0) -> OcalTrace:
+        """One read (OCD 4.1 0x36): entries from `start` (0..31), at most 31 per answer."""
+        if not 0 <= start <= 31:
+            raise ValueError("trace start 0..31")
+        return parse_ocal_trace(self.call(OCAL_TRACE, bytes([TRACE_READ, start])))
+
+    def ocal_trace_read_all(self) -> OcalTrace:
+        """The whole trace: the read at start 0, and a second at start 31 when the trace holds
+        more than 31 entries."""
+        first = self.ocal_trace_read(0)
+        if first.count > len(first.entries) and len(first.entries) == 31:
+            second = self.ocal_trace_read(31)
+            first.entries = first.entries + second.entries
+        return first
+
+    def ocal_wait_trace(self, timeout: float = 30.0) -> OcalTrace:
+        """Polls OCAL_TRACE until the trace is full (state 3) and returns all its entries;
+        DeviceError after `timeout` seconds (nothing changed while it was armed, or the change
+        left the meter on a screen other than 1)."""
+        deadline = self._clock() + timeout
+        while True:
+            if self.ocal_trace_read(0).state == 3:
+                return self.ocal_trace_read_all()
+            if self._clock() > deadline:
+                raise DeviceError("the trace did not fill within %.0f s" % timeout)
+            self._sleep(0.1)
+
+    def monitor(self) -> Monitor:
+        return parse_monitor(self.call(MONITOR))
 
     def _after_restart(self) -> None:
         """After a restart the old link is dead: with a reconnect function the new link is

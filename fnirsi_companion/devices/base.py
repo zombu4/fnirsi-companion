@@ -159,6 +159,8 @@ class Reading:
     validity: str               # "valid" | "overload" | "no reading" | "held" | "unknown"
     secondary: "Reading | None"
     key: tuple                  # statistics / trend restart when it changes
+    unspecified: bool = False   # outside the manual's accuracy table (LC1020E MEASURE marker)
+    gain_flags: int | None = None    # LC1020E MEASURE byte 65 (OCAL flags); None = not sent
 
 
 @dataclass

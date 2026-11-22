@@ -26,6 +26,7 @@ _app = QApplication.instance() or QApplication([])
 
 import fake_2c53t as f2                                          # noqa: E402
 import fake_lc1020e as fl                                        # noqa: E402
+import test_ocal_solve as ts                                     # noqa: E402
 import test_releases                                             # noqa: E402
 from fnirsi_companion import __main__ as main_mod                # noqa: E402
 from fnirsi_companion.core import settings as settings_mod       # noqa: E402
@@ -170,8 +171,8 @@ class DetectAndSwitch(Bench):
                                                  "Meter settings", "Meter", "Screen",
                                                  "Diagnostics", "Settings"])
         self.assertEqual([p.title for p in self.win.active.pages],
-                         ["LCR", "Compare", "Settings", "Calibration", "Backup", "Keys", "Meter",
-                          "Screenshot", "Diagnostics"])
+                         ["LCR", "Compare", "Settings", "Calibration", "Gain calibration", "Backup",
+                          "Keys", "Meter", "Screenshot", "Diagnostics"])
         self.assertIn(lc.MEASURE_STREAM, self.lc_meter.cmds())
         self.assertEqual(self.lc_meter.measure_stream, 0)
         self.plug(LC_PORT, C2_PORT)
@@ -529,6 +530,355 @@ class Lc1020ePages(Bench):
 
 
 # ----------------------------------------------------------------------------------------------
+class Lc1020eNewFirmwarePages(Bench):
+    """The LC1020E with the capability bits 22 .. 24: the Compare page shows the judgement and
+    sets the tolerance mode, the secondary value shows "unspecified"; old firmware shows "-"."""
+
+    def connect(self, caps):
+        self.lc_meter.caps = caps
+        self.plug(LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        return self.page("Compare")
+
+    def test_compare_tail_and_tolerance_form(self):
+        cp = self.connect(fl.NEW_CAPS)
+        self.done(cp.refresh())
+        self.assertEqual(cp.labels["result"].text(), "IN")
+        self.assertEqual(cp.labels["signed"].text(), "+1.5 %")
+        self.assertTrue(cp.tol_button.isEnabled())
+        cp.tol_mode.setCurrentIndex(1)
+        cp.tol_lower.setValue(-2.5)
+        cp.tol_upper.setValue(1.0)
+        cp.tol_kind.setCurrentIndex(3)
+        cp.tol_value.setValue(0.5)
+        self.done(cp.apply_tolerance())
+        self.assertIn((lc.TOLERANCE_SET, struct.pack("<BiiBBf", 1, -250, 100, 0, 3, 0.5)),
+                      self.lc_meter.log)
+        self.assertEqual(cp.labels["result"].text(), "HI")
+        self.assertEqual(cp.labels["limits"].text(), "-2.5 .. 1 %")
+        self.assertEqual(cp.labels["secondary_limit"].text(), "ESR max 0.5")
+
+    def test_old_firmware_rows_and_form(self):
+        cp = self.connect(fl.ALL_CAPS)
+        self.done(cp.refresh())
+        self.assertEqual(cp.labels["result"].text(), "-")
+        self.assertFalse(cp.tol_button.isEnabled())
+
+    def test_secondary_unspecified_on_the_live_page(self):
+        self.connect(fl.NEW_CAPS)
+        self.lc_meter.measure_markers = 2
+        self.lc_meter.pending.append((lc.MEASURE, fl.build_measure(markers=2)))
+        self.done(self.page("Diagnostics").ping())
+        live = self.win.live
+        self.assertTrue(wait(lambda: live.last is not None))
+        self.assertTrue(live.last.secondary.unspecified)
+        self.assertIn("unspecified", live.secondary.text())
+
+
+# ----------------------------------------------------------------------------------------------
+class Lc1020eOcalPages(Bench):
+    """The own calibration area (OWN_CAL_DESIGN.md 6.3): the Gain calibration page, the LCR page's
+    Vac / Iac and gain cal rows and the Backup page's area card, on a meter with capability bit 26."""
+
+    def setUp(self):
+        super().setUp()
+        self.lc_meter.caps = fl.OCAL_CAPS
+        self.lc_meter.window_step = 2          # a window closed per OCAL_RAW read, two at a time: no waiting
+        self.plug(LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        self.dev = self.win.active.device
+        self.gp = self.page("Gain calibration")
+        self.assertTrue(wait(lambda: self.gp.info is not None))
+
+    def sections(self, slot=0):
+        rec = lc.parse_ocal_record(bytes(self.lc_meter.slots[slot]), slot)
+        self.assertTrue(rec.valid)
+        return rec, lc.parse_body(rec.body)
+
+    def test_the_page_is_registered_and_shows_the_empty_area(self):
+        titles = [p.title for p in self.win.active.pages]
+        self.assertEqual(titles[3:6], ["Calibration", "Gain calibration", "Backup"])
+        self.assertEqual(self.win.nav_titles(), ["Live", "Trend", "Log", "Compare", "Meter settings",
+                                                 "Meter", "Screen", "Diagnostics", "Settings"])
+        gp = self.gp
+        self.assertEqual((gp.info_label.text(), gp.sections_label.text(), gp.retake_label.text()),
+                         ("none", "none", "not needed"))
+        self.assertEqual(gp.table.rowCount(), 6)
+        self.assertFalse(gp.write_button.isEnabled())              # nothing solved yet
+        self.assertTrue(gp.start_button.isEnabled())
+
+    def test_resistor_list(self):
+        gp = self.gp
+        res = gp.resistors()
+        self.assertEqual([r.value for r in res], [10.0, 100.0, 1e3, 1e4, 1e5, 1e6])
+        for r in res:
+            self.assertAlmostEqual(r.rel_unc, 0.001, places=12)           # 0.1 % typed
+        self.assertEqual(gp.table.item(0, 0).text(), "10 ohm")
+        gp.add_resistor("47 ohm", 47.0, 0.5)
+        self.assertEqual(gp.table.rowCount(), 7)
+        self.assertAlmostEqual(gp.resistors()[6].rel_unc, 0.005, places=12)
+        gp.table.setCurrentCell(6, 0)
+        gp.remove_resistor()
+        self.assertEqual(gp.table.rowCount(), 6)
+        gp.table.item(1, 1).setText("abc")
+        with self.assertRaises(ValueError):
+            gp.resistors()
+        self.assertIsNone(gp.start_run(1))
+        self.assertIn("not a number", gp.status.text())
+        gp.table.item(1, 1).setText("-5")
+        with self.assertRaises(ValueError):
+            gp.resistors()
+        self.assertIsNone(gp.start_run(99))
+        self.assertIsNone(gp.solve())
+        self.assertNotIn(lc.OCAL_LOCK, self.lc_meter.cmds())
+
+    def test_run_one_resistor_then_the_short(self):
+        gp = self.gp
+        self.lc_meter.dut_fn = lambda hz: 1000 + 0j
+        self.done(gp.start_run(2), 90)
+        # 6 frequencies x 2 levels, the autoranged cell (2, 2, 1) and its 10 neighbours each
+        self.assertEqual(len(gp.windows), 132)
+        self.assertEqual(gp.table.item(2, 3).text(), "132")
+        self.assertEqual(gp.progress.value(), 1000)
+        self.assertIn("132 windows of resistor 3", gp.status.text())
+        self.assertIsNone(self.lc_meter.lock)                              # released at the end
+        self.lc_meter.dut_fn = lambda hz: 0.05 + 0.01j
+        self.done(gp.run_shortopen("short"), 90)
+        self.assertEqual((gp.short_takes, len(gp.shortopen)), (1, 96))
+        gp.clear_data()
+        self.assertEqual((len(gp.windows), len(gp.shortopen), gp.short_takes), (0, 0, 0))
+        self.assertEqual(gp.table.item(2, 3).text(), "0")
+
+    def test_solve_and_write_gain(self):
+        gp = self.gp
+        while gp.table.rowCount() > 3:
+            gp.table.removeRow(3)
+        for r, v in enumerate((100.0, 1000.0, 10000.0)):
+            gp.table.item(r, 1).setText("%g" % v)
+        gp.windows = ts.decade_run()                      # injected factors, three decades
+        self.done(gp.solve())
+        self.assertEqual(gp.result.written_frequencies(), [1000])
+        self.assertIn("1000 Hz: GAIN written", gp.report.toPlainText())
+        self.assertTrue(gp.write_button.isEnabled())
+        self.done(gp.write_gain(), 30)
+        title, text = self.asked[-1]
+        self.assertEqual(title, "Write the gain factors")
+        self.assertIn("1000 Hz", text)
+        self.assertIn(".ocal backup", text)
+        rec, secs = self.sections()
+        self.assertEqual((rec.sequence, sorted(secs)), (1, [0, 1]))
+        gain = lc.unpack_gain(secs[lc.SEC_GAIN])
+        self.assertEqual((gain[2].zeta_mag_mask, gain[2].nu_phase_mask), (ts.MASK_Z, ts.MASK_N))
+        self.assertTrue(lc.unpack_meta(secs[lc.SEC_META])[1].startswith("gain cal "))
+        self.assertTrue(list((self.tmp_backups() / ("LC1020E-" + LC_SERIAL)).glob("*.ocal")))
+        self.assertTrue(wait(lambda: "slot 0, sequence 1" in gp.info_label.text()))
+        self.assertTrue(wait(lambda: "GAIN at 1000 Hz" in gp.sections_label.text()))
+
+    def tmp_backups(self):
+        from pathlib import Path
+        return Path(self.tmp.name) / "backups"
+
+    def test_write_gain_not_confirmed_sends_nothing(self):
+        gp = self.gp
+        while gp.table.rowCount() > 3:
+            gp.table.removeRow(3)
+        for r, v in enumerate((100.0, 1000.0, 10000.0)):
+            gp.table.item(r, 1).setText("%g" % v)
+        gp.windows = ts.decade_run()
+        self.done(gp.solve())
+        self.answers.append(None)
+        self.assertIsNone(gp.write_gain())
+        self.assertNotIn(lc.OCAL_WRITE, self.lc_meter.cmds())
+        self.assertIn("not confirmed", gp.status.text())
+
+    def test_constants_clip_and_settle(self):
+        gp = self.gp
+        gp.clip_obs = {(0, 3): (5, 4095), (1, 2): (40, 4010)}
+        gp.propose_clip()
+        self.assertEqual(gp.clip_values()[3], (21, 4095))
+        self.assertEqual(gp.clip_values()[10], (56, 3994))
+        gp.settle_table.item(1, 3).setText("40")
+        self.done(gp.write_constants(), 30)
+        _rec, secs = self.sections()
+        self.assertEqual(sorted(secs), [0, 2, 3])
+        self.assertEqual(lc.unpack_clip(secs[lc.SEC_CLIP])[3], (21, 4095))
+        table = lc.unpack_settle(secs[lc.SEC_SETTLE])
+        self.assertEqual((table[0], table[1][3], table[5], table[6]), ([26] * 6, 40, [5] * 6, [5] * 6))
+        gp.clip_table.item(3, 1).setText("0")                              # edit away, then read back
+        gp.settle_table.item(1, 3).setText("26")
+        self.done(gp.read_constants())
+        self.assertEqual((gp.clip_table.item(3, 1).text(), gp.settle_table.item(1, 3).text()), ("21", "40"))
+
+    def test_constants_the_meter_would_refuse_are_not_sent(self):
+        gp = self.gp
+        gp.clip_table.item(0, 2).setText("100")                            # hi - lo = 100: not above 3600
+        self.assertIsNone(gp.write_constants())
+        self.assertIn("would refuse", gp.status.text())
+        gp.clip_table.item(0, 2).setText("4095")
+        gp.settle_table.item(2, 2).setText("abc")
+        self.assertIsNone(gp.write_constants())
+        self.assertIn("not a number", gp.status.text())
+        self.assertNotIn(lc.OCAL_WRITE, self.lc_meter.cmds())
+
+    def test_a_settle_trace_fills_its_cell(self):
+        gp = self.gp
+        gp.kind_combo.setCurrentIndex(gp.kind_combo.findData(2))
+        gp.trace_freq.setCurrentIndex(2)                                   # 1000 Hz
+        self.done(gp.measure_trace(), 60)
+        self.assertEqual(gp.settle_table.item(2, 2).text(), "55")          # derived in test_ocal_solve
+        self.assertIn("kind 2 at 1000 Hz: 55 ms", gp.status.text())
+        self.assertEqual(self.lc_meter.trace["state"], 0)
+
+    def test_level_monitor(self):
+        gp = self.gp
+        gp.mon_table.item(2, 1).setText("0.5")                             # DMM: 0.5 V at 1 kHz
+        self.assertEqual(gp.compute_kv(), {})                              # nothing captured yet
+        self.done(gp.capture(2), 60)
+        a_v, c5, nu = gp.captures[2]
+        self.assertEqual((a_v, c5, nu), (2000.0, 2, 1.0))                  # the fake's window, no GAIN yet
+        kv = gp.compute_kv()
+        self.assertAlmostEqual(kv[2], 0.5 * 4 / 2000.0, places=12)         # V x G[2] / A_V
+        self.assertEqual(gp.mon_table.item(2, 3).text(), "0.001")
+        gp.bandwidth.setValue(0.5)                                         # a 500 Hz DMM: 1 kHz is above it
+        self.assertEqual(gp.compute_kv(), {})
+        self.assertEqual(gp.mon_table.item(2, 3).text(), "above the DMM's bandwidth")
+        gp.bandwidth.setValue(100.0)
+        self.done(gp.write_monitor(), 30)
+        self.assertIn("1000 Hz", self.asked[-1][1])
+        _rec, secs = self.sections()
+        mask, kvs = lc.unpack_monitor(secs[lc.SEC_MONITOR])
+        self.assertEqual(mask, 1 << 2)
+        self.assertAlmostEqual(kvs[2], 0.001, places=9)
+        # a second frequency: the first one stays in the new record
+        gp.mon_table.item(2, 1).setText("")
+        gp.mon_table.item(3, 1).setText("0.4")
+        self.done(gp.capture(3), 60)
+        self.done(gp.write_monitor(), 30)
+        rec, secs = self.sections(1)
+        self.assertEqual(rec.sequence, 2)
+        mask, kvs = lc.unpack_monitor(secs[lc.SEC_MONITOR])
+        self.assertEqual(mask, (1 << 2) | (1 << 3))
+        self.assertAlmostEqual(kvs[2], 0.001, places=9)
+        self.assertAlmostEqual(kvs[3], 0.4 * 4 / 2000.0, places=9)
+
+    def test_nothing_to_write_without_a_capture(self):
+        gp = self.gp
+        self.assertIsNone(gp.write_monitor())
+        self.assertIn("no kV to write", gp.status.text())
+        self.assertIsNone(gp.capture(7))
+        self.assertNotIn(lc.OCAL_WRITE, self.lc_meter.cmds())
+
+    def test_the_current_check_line(self):
+        gp = self.gp
+        gp.dmm_ma.setValue(10.0)
+        self.done(gp.compare_current())
+        self.assertIn("no calibrated current", gp.current_label.text())
+        self.lc_meter.monitor_values = dict(v=1.0, i=0.01, a_v=250.0, a_i=4.0, flags=3)
+        self.done(gp.compare_current())
+        self.assertEqual(gp.current_label.text(), "I by the meter 10 mA / I by the DMM 10 mA = 1.0000")
+
+    def test_the_event_refreshes_the_record(self):
+        n = self.lc_meter.cmds().count(lc.OCAL_INFO)
+        self.win.active.link.event_frame.emit(
+            fl.Frame(1, 4, lc.EV_OCAL_CHANGED, struct.pack("<BII", 0, 1, 3), 0.0))
+        self.assertTrue(wait(lambda: self.lc_meter.cmds().count(lc.OCAL_INFO) > n))
+        self.assertTrue(any("event OCAL_CHANGED" in t for t in self.win.events.lines()))
+
+    def test_lcr_page_rows(self):
+        p = self.page("LCR")
+        self.assertTrue(p.ocal)
+        self.assertFalse(p.vac_row.isHidden() or p.gain_row.isHidden())
+
+        def reading(flags):
+            return lc.measure_to_reading(lc.parse_measure(fl.build_measure(markers=0, ocal=flags), True),
+                                         1.0, 2.0)
+        p.lcd_flags(reading(0b0001))
+        self.assertEqual((p.gain_row.value.text(), p.gain_warning.text()), ("applied", ""))
+        self.done(p._monitor_job)                                           # MONITOR: uncalibrated
+        self.assertTrue(p.vac_row.value.text().startswith("uncalibrated"))
+        self.lc_meter.monitor_values = dict(v=1.0, i=0.01, a_v=250.0, a_i=4.0, flags=3)
+        p._monitor_at = 0.0
+        p.lcd_flags(reading(0b0010))                                        # GAIN here, but not at this cell
+        self.assertEqual(p.gain_row.value.text(), "not applied")
+        self.assertTrue(p.gain_warning.text().startswith("Warning:"))
+        self.done(p._monitor_job)
+        self.assertEqual(p.vac_row.value.text(), "1 V / 10 mA")
+        p._monitor_at = 0.0
+        p.lcd_flags(reading(0b1100))
+        self.assertEqual(p.gain_row.value.text(), "not applied, lock active, retake short / open")
+        self.assertEqual(p.gain_warning.text(), "")
+        self.done(p._monitor_job)
+        n = self.lc_meter.cmds().count(lc.MONITOR)
+        p.lcd_flags(reading(0b0001))                                        # within a second: no new request
+        self.assertEqual(self.lc_meter.cmds().count(lc.MONITOR), n)
+        p.lcd_flags(None)                                                   # no reading: nothing changes
+        no_gain = lc.measure_to_reading(lc.parse_measure(fl.build_measure(markers=0)), 1.0, 2.0)
+        p.lcd_flags(no_gain)                                                # 65-byte record: gain_flags None
+        self.assertEqual(self.lc_meter.cmds().count(lc.MONITOR), n)
+
+    def test_lcr_monitor_without_a_reading_text(self):
+        p = self.page("LCR")
+        p.show_monitor(lc.parse_monitor(fl.build_monitor(flags=lc.MON_NO_READING | lc.MON_V_CALIBRATED)))
+        self.assertEqual(p.vac_row.value.text(), "no reading")
+        p.show_monitor(lc.parse_monitor(fl.build_monitor(1.5, 0.002, 90.0, 3.0, lc.MON_V_CALIBRATED
+                                                         | lc.MON_LOCK)))
+        self.assertEqual(p.vac_row.value.text(), "1.5 V / 2 mA (lock)")
+        p.show_gain(None)
+        self.assertEqual(p.gain_row.value.text(), "—")
+
+    def test_backup_page_area_card(self):
+        bp = self.page("Backup")
+        self.assertFalse(bp.ocal_restore_button.isEnabled())                # no file selected
+        self.done(bp.ocal_info())
+        self.assertEqual(bp.ocal_state.text(), "flags 0x0000: none; no active record; other slot sequence 0")
+        body = ts_body("A")
+        self.lc_meter.slots[0] = fl.ocal_slot(fl.ocal_record(body, 1))
+        self.done(bp.ocal_backup())
+        self.assertEqual(bp.ocal_files.count(), 1)
+        bp.ocal_files.setCurrentRow(0)
+        self.assertEqual(bp.ocal_records.text().splitlines()[0],
+                         "slot 0: format 1, sequence 1, 100 bytes, UID %s" % LC_SERIAL)
+        self.assertTrue(bp.ocal_records.text().splitlines()[1].startswith("slot 1: no record"))
+        self.assertTrue(bp.ocal_restore_button.isEnabled())
+        bp.ocal_slot.setCurrentIndex(0)
+        self.done(bp.ocal_restore(), 30)
+        self.assertEqual(self.asked[-1][0], "Restore record 0")
+        self.assertTrue(bp.ocal_result.text().startswith("commit OK, slot 1, sequence 2"))
+        self.assertEqual(lc.parse_ocal_record(bytes(self.lc_meter.slots[1])).body, body)
+        self.done(bp.ocal_rollback(0), 30)
+        self.assertEqual(bp.ocal_result.text(), "record in slot 0, sequence 1, flags 0x0007 active")
+        self.done(bp.ocal_info())
+        self.assertIn("active slot 0", bp.ocal_state.text())
+        self.answers.append(None)
+        self.assertIsNone(bp.ocal_rollback(1))                              # not confirmed: nothing sent
+        self.assertEqual(self.lc_meter.cmds().count(lc.OCAL_ROLLBACK), 1)
+
+
+def ts_body(note: str) -> bytes:
+    return lc.build_body({lc.SEC_META: lc.pack_meta(1700000000, note)})
+
+
+# ----------------------------------------------------------------------------------------------
+class Lc1020eNoOcalPages(Bench):
+    """A meter without capability bit 26: the area's pages are built, their controls are off and
+    nothing is sent to the area."""
+
+    def test_controls_are_off_and_nothing_is_sent(self):
+        self.plug(LC_PORT)
+        self.assertTrue(self.connected("LC1020E"))
+        gp = self.page("Gain calibration")
+        for w in (gp.start_button, gp.info_button, gp.write_button, gp.capture_button):
+            self.assertFalse(w.isEnabled())
+        self.assertIn("capability bit 26", gp.start_button.toolTip())
+        lcr = self.page("LCR")
+        self.assertFalse(lcr.ocal)
+        self.assertTrue(lcr.vac_row.isHidden() and lcr.gain_row.isHidden())
+        bp = self.page("Backup")
+        self.assertFalse(bp.ocal_backup_button.isEnabled())
+        self.assertFalse(bp.ocal_restore_button.isEnabled())
+        self.assertEqual([c for c in self.lc_meter.cmds() if 0x30 <= c <= 0x37], [])
+
+
 class C2c53tPages(Bench):
     def setUp(self):
         super().setUp()

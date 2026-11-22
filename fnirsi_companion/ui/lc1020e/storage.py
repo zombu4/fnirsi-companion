@@ -8,7 +8,11 @@ Calibration  CALIBRATE open (type 11) and short (type 0), backup first, typed "O
 Backup       both settings copies into a dated file bound to the meter's UID (LC1020E.backup), the
              files of this meter, comparison of a file with the meter's copies now, restore of one
              copy (LC1020E.restore: same UID only, the copy checked, backup first), and the
-             recovery commands 0x54 .. 0x5A with the conditions SL 9.3 gives for them.
+             recovery commands 0x54 .. 0x5A with the conditions SL 9.3 gives for them. With the
+             own calibration area (CAP_OCAL, OWN_CAL_DESIGN.md 6.1): OCAL_INFO, the .ocal backups of
+             both area slots (LC1020E.ocal_backup) listed with their records, the restore of one
+             record (LC1020E.ocal_restore: same UID in the name and the record header only, backup
+             first) and OCAL_ROLLBACK.
 """
 
 from __future__ import annotations
@@ -209,23 +213,20 @@ class CalibrationPage(Page):
 
     def on_event(self, ev) -> None:
         if isinstance(ev, lc.Event) and ev.cmd == lc.EV_CALIBRATION and "status" in ev.fields:
-            f = ev.fields
-            self.progress.setText("status %s, step %d, type %d" % (
-                lc.CAL_STATUS.get(f["status"], f["status"]), f["step"], f["type"]))
+            sweep = self.dev is not None and self.dev.info.has(lc.CAP_CAL_SWEEP)
+            self.progress.setText(lc.cal_progress(ev.fields, sweep))
 
 
 def run_calibration(page: Page, dev, cal_type: int, word: str, label: QLabel):
     def done(r: lc.CalResult):
-        text = "calibration status %s, type %d, save status 0x%08X" % (
-            lc.CAL_STATUS.get(r.cal_status, r.cal_status), r.cal_type, r.save_status)
+        text = r.describe()
         label.setText(text)
         page.say(text)
 
     def failed(e):
         rec = getattr(e, "record", None)
         if isinstance(rec, lc.CalResult):
-            label.setText("status %d: calibration status %s, save status 0x%08X" % (
-                rec.status, lc.CAL_STATUS.get(rec.cal_status, rec.cal_status), rec.save_status))
+            label.setText("status %d: %s" % (rec.status, rec.describe()))
         else:
             label.setText(describe_error(e, lc.STATUS_NAME))
 
@@ -300,15 +301,152 @@ class BackupPage(Page):
         self.flags = state_row.value
         rec.add(state_row)
         self.body.addWidget(rec)
+        self._build_ocal_card()
         self.list_backups()
 
     def extra_enabled(self, widget) -> bool:
         if widget in (getattr(self, "compare_button", None), getattr(self, "restore_button", None)):
             return self.selected() is not None
+        if widget is getattr(self, "ocal_restore_button", None):
+            return self.ocal_selected() is not None
         return True
 
     def folder(self) -> Path:
         return Path(self.ctx.settings.backups_folder())
+
+    # -- the own calibration area (OCD 6.1) -----------------------------------------------------
+    def _build_ocal_card(self) -> None:
+        dev = self.dev
+        card = Card("Own calibration area")
+        self.ocal_info_button = self.control(set_kind(QPushButton("Read OCAL_INFO"), "small"),
+                                             lc.OCAL_INFO)
+        self.ocal_info_button.clicked.connect(self.ocal_info)
+        self.ocal_backup_button = self.control(set_kind(QPushButton("Back up the area now"),
+                                                        "primary"), lc.OCAL_READ)
+        self.ocal_backup_button.clicked.connect(self.ocal_backup)
+        card.add_right(self.ocal_backup_button)
+        self.ocal_state = label("", "mono", word_wrap=True)
+        self.ocal_state.setObjectName("ocal_state")
+        self.ocal_files = QListWidget()
+        self.ocal_files.setObjectName("ocal_backups")
+        self.ocal_files.setMaximumHeight(LIST_MAX_H)
+        self.ocal_files.setMinimumHeight(90)
+        self.ocal_files.currentItemChanged.connect(lambda *_: self.ocal_selection_changed())
+        self.ocal_records = label("", "mono", word_wrap=True)
+        self.ocal_records.setObjectName("ocal_records")
+        self.ocal_slot = Segmented(["slot 0", "slot 1"])
+        self.ocal_restore_button = self.control(set_kind(QPushButton("Restore this record…"),
+                                                         "danger"), lc.OCAL_WRITE, lc.OCAL_READ)
+        self.ocal_restore_button.clicked.connect(self.ocal_restore)
+        self.ocal_rollback_button = self.control(set_kind(QPushButton("Roll back the active record…"),
+                                                          "danger"), lc.OCAL_ROLLBACK, lc.OCAL_READ)
+        self.ocal_rollback_button.clicked.connect(lambda: self.ocal_rollback(0))
+        self.ocal_clear_button = self.control(set_kind(QPushButton("Revoke every record…"),
+                                                       "danger"), lc.OCAL_ROLLBACK, lc.OCAL_READ)
+        self.ocal_clear_button.clicked.connect(lambda: self.ocal_rollback(1))
+        self.ocal_result = label("", "mono", word_wrap=True)
+        self.ocal_result.setObjectName("ocal_result")
+        card.add(label(".ocal files of this meter (UID %s), newest first: both slots of the "
+                       "area as read before each write." % dev.info.uid_hex, "hint", word_wrap=True))
+        card.add(self.ocal_files)
+        card.add(self.ocal_records)
+        card.add(row(self.ocal_info_button, "Record", self.ocal_slot, self.ocal_restore_button))
+        card.add(row(self.ocal_rollback_button, self.ocal_clear_button))
+        card.add(self.ocal_state)
+        card.add(self.ocal_result)
+        self.body.addWidget(card)
+        self.list_ocal_backups()
+
+    def ocal_selected(self) -> Path | None:
+        it = self.ocal_files.currentItem() if hasattr(self, "ocal_files") else None
+        return Path(it.data(256)) if it is not None else None
+
+    def list_ocal_backups(self) -> None:
+        self.ocal_files.clear()
+        for p in self.dev.list_ocal_backups(self.folder()):
+            it = QListWidgetItem(p.name)
+            it.setData(256, str(p))
+            self.ocal_files.addItem(it)
+        self.ocal_selection_changed()
+
+    def ocal_selection_changed(self) -> None:
+        """The records of the selected file, as the meter's load would see them."""
+        path = self.ocal_selected()
+        text = ""
+        if path is not None:
+            try:
+                data = lc.LC1020E.load_ocal_file(path, self.dev.info.uid_hex)
+                text = "\n".join(r.describe() for r in lc.parse_ocal_file(data))
+            except lc.BackupMismatch as e:
+                text = "unreadable: %s" % e
+        self.ocal_records.setText(text)
+        self.refresh_controls()
+
+    def ocal_info(self):
+        dev = self.dev
+        return self.run("OCAL_INFO", lambda p: dev.ocal_info(), self.show_ocal_info)
+
+    def show_ocal_info(self, i: lc.OcalInfo) -> None:
+        text = i.describe()
+        if i.sections_present:
+            text += "; sections " + ", ".join(lc.SECTION_NAME[k] for k in lc.SECTION_NAME
+                                              if i.has_section(k))
+        if i.sections_rejected:
+            text += "; rejected " + ", ".join(i.rejected_names())
+        if i.active:
+            text += '; META %d "%s"' % (i.meta_time, i.meta_note)
+        self.ocal_state.setText(text)
+        self.say("OCAL_INFO read")
+
+    def ocal_backup(self):
+        dev, folder = self.dev, self.folder()
+
+        def done(path):
+            self.list_ocal_backups()
+            self.say("area backup: %s" % path)
+
+        return self.run("area backup", lambda p: dev.ocal_backup(folder), done, exclusive=True)
+
+    def ocal_restore(self):
+        path = self.ocal_selected()
+        if path is None:
+            return None
+        slot, dev = self.ocal_slot.currentIndex(), self.dev
+        word = self.confirm("Restore record %d" % slot,
+                            "OCAL_WRITE writes the record of slot %d of %s into the meter's own "
+                            "calibration area as a new record (the meter gives it a new sequence "
+                            "and checks its values), only when the file and the record belong to "
+                            "this meter's UID. Both slots are read into a .ocal backup file first."
+                            % (slot, path.name))
+        if word is None:
+            return None
+
+        def done(r):
+            self.ocal_result.setText(r.describe())
+            self.list_ocal_backups()
+            self.say("restored slot %d: %s" % (slot, r.describe()))
+
+        return self.run("area restore", lambda p: dev.ocal_restore(path, slot, word), done,
+                        exclusive=True)
+
+    def ocal_rollback(self, mode: int):
+        dev = self.dev
+        what = ("the active record is revoked and the other slot's record becomes active"
+                if mode == 0 else "every record of this meter is revoked: the meter reads as "
+                                   "without the area")
+        word = self.confirm("OCAL_ROLLBACK mode %d" % mode,
+                            "OCAL_ROLLBACK: %s. Both slots are read into a .ocal backup file "
+                            "first." % what)
+        if word is None:
+            return None
+
+        def done(r):
+            self.ocal_result.setText(r.describe())
+            self.list_ocal_backups()
+            self.say("rollback: %s" % r.describe())
+
+        return self.run("OCAL_ROLLBACK", lambda p: dev.ocal_rollback(mode, word), done,
+                        exclusive=True)
 
     def selected(self) -> Path | None:
         it = self.files.currentItem()

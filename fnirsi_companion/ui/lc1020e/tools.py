@@ -212,9 +212,12 @@ class LcDiagnosticsPage(Page):
         def done(res):
             m, r = res
             lines = ["result %d, time %d ms" % (m.result, m.time),
-                     "main: %s %s (%s)" % (r.quantity, r.text, r.validity),
-                     "secondary: %s %s (%s)" % (r.secondary.quantity, r.secondary.text,
-                                                 r.secondary.validity),
+                     "main: %s %s (%s%s)" % (r.quantity, r.text, r.validity,
+                                             ", unspecified" if r.unspecified else ""),
+                     "secondary: %s %s (%s%s)" % (r.secondary.quantity, r.secondary.text,
+                                                   r.secondary.validity,
+                                                   ", unspecified" if r.secondary.unspecified
+                                                   else ""),
                      "Z %g ohm, theta %g degrees, frequency %d Hz, level %g V, bias %g V" % (
                          m.z, m.theta, m.frequency, m.level, m.bias),
                      "range %d, speed %d, circuit %s, parallel %d" % (

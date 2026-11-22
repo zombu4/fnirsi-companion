@@ -13,13 +13,23 @@ series / parallel byte of the MEASURE record (PROTOCOL.md: 0 series, 1 parallel;
 the reading's key, devices.lc1020e.measure_to_reading); AUTO when the current choice of the meter's
 RANGE list (setting 5) reads "AUTO"; the mode text is the current choices of FREQ (2) and AMP (3).
 
+With CAP_OCAL (OWN_CAL_DESIGN.md "OCD" 6.3) the Measurement card has two more rows: "Vac / Iac" from
+the MONITOR command (read at most once a second while readings arrive; "uncalibrated" with the counts
+in place of the unit when flag bit 0 is clear) and "gain cal" from byte 65 of the MEASURE record (the
+gain correction applied at this cell; a warning when bit 1 says the frequency has GAIN but this cell
+is not calibrated).
+
 Compare (SL 5.3, 6.3): the COMPARE record (refreshed while the page is shown, one request
 outstanding), and COMPARE_SET with the limits of SL 5.3.1; the form shows what the meter stored.
+With CAP_TOLERANCE the record's judgement (IN / HI / LO, signed deviation, limits in force, secondary
+limit) is shown and the TOLERANCE_SET form sets the mode (RAM only); older firmware leaves those
+rows at "-" and the form disabled.
 """
 
 from __future__ import annotations
 
 import math
+import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel,
@@ -27,7 +37,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayo
 
 from ...devices import lc1020e as lc
 from ..base import Page, describe_error
-from ..common.data_pages import SECONDARY_LABEL
+from ..common.data_pages import SECONDARY_LABEL, fmt_si
 from ..widgets import Card, Segmented, StatRow, label, set_kind
 
 # STATE field of each LCR_SET setting / LCR_TABLES list id (SL 5.3 table "Settings of LCR_SET")
@@ -36,6 +46,7 @@ STATE_FIELD = {0: "func", 1: "secondary", 2: "frequency", 3: "level", 4: "bias",
 SEGMENTED_MAX = 6          # lists of up to this many entries get a segmented control
 LCD_WORDS = ["AUTO", "HOLD", "SER", "PAR"]
 KEY_PARALLEL = 9           # index of the series / parallel byte in the reading's key
+MONITOR_PERIOD = 1.0       # seconds between two MONITOR requests while readings arrive
 
 
 def entry_index(lst: lc.LcrList, value) -> int:
@@ -85,6 +96,18 @@ class LcrPage(Page):
         card.add(bottom)
         self.flags = label("—", "hint", word_wrap=True)
         card.add(self.flags)
+        self.vac_row = StatRow("Vac / Iac", "—")
+        self.vac_row.value.setObjectName("lcr_vac")
+        self.gain_row = StatRow("gain cal", "—", line=False)
+        self.gain_row.value.setObjectName("lcr_gain")
+        self.gain_warning = label("", "hint", word_wrap=True)
+        self.gain_warning.setObjectName("lcr_gain_warning")
+        self.ocal = device.has(lc.MONITOR)
+        for w in (self.vac_row, self.gain_row, self.gain_warning):
+            w.setVisible(self.ocal)
+            card.add(w)
+        self._monitor_at = 0.0
+        self._monitor_job = None
         self.body.addWidget(card)
         self.state = None
         if device.has(lc.LCR_TABLES):
@@ -188,6 +211,50 @@ class LcrPage(Page):
         self.flags.setText("screen %s; flags: %s; dropped stream frames %d" % (
             lc.SCREEN_NAME.get(st.screen, st.screen), ", ".join(names) or "none", st.dropped))
 
+    # -- level monitor and gain mark (CAP_OCAL, OCD 6.3) ---------------------------------------------
+    def show_gain(self, flags: int | None) -> None:
+        """MEASURE byte 65: bit 0 gain applied, bit 1 GAIN present for this frequency but not
+        applied at this cell, bit 2 lock active, bit 3 retake short / open."""
+        if flags is None:
+            self.gain_row.value.setText("—")
+            self.gain_warning.setText("")
+            return
+        parts = ["applied" if flags & lc.OCAL_FLAG_GAIN else "not applied"]
+        if flags & lc.OCAL_FLAG_LOCK:
+            parts.append("lock active")
+        if flags & lc.OCAL_FLAG_RETAKE:
+            parts.append("retake short / open")
+        self.gain_row.value.setText(", ".join(parts))
+        self.gain_warning.setText(
+            "Warning: this frequency has gain factors but this range / gain cell is not "
+            "calibrated; the reading is without the gain correction." if flags & lc.OCAL_FLAG_GAIN_MISSING
+            else "")
+
+    def show_monitor(self, m: lc.Monitor) -> None:
+        if m.no_reading:
+            text = "no reading"
+        elif not m.v_calibrated:
+            text = "uncalibrated: A_V,ref %.5g, A_I,ref %.5g counts" % (m.a_v_ref, m.a_i_ref)
+        else:
+            text = "%s / %s" % (fmt_si(m.v_rms, "V"), fmt_si(m.i_rms, "A"))
+        self.vac_row.value.setText(text + (" (lock)" if m.lock else ""))
+
+    def _follow_reading(self, reading) -> None:
+        """Called with each reading the Live page shows: the gain mark from the reading, the
+        monitor row from MONITOR at most once a second and one request at a time."""
+        if not self.ocal or reading is None or reading.gain_flags is None:
+            return
+        self.show_gain(reading.gain_flags)
+        now = time.monotonic()
+        if self.busy or now - self._monitor_at < MONITOR_PERIOD:
+            return
+        if self._monitor_job is not None and not self._monitor_job.done.is_set():
+            return
+        self._monitor_at = now
+        dev = self.dev
+        self._monitor_job = self.run("MONITOR", lambda p: dev.monitor(), self.show_monitor,
+                                     quiet=True)
+
     # -- the Live page's LCD ------------------------------------------------------------------
     def _choice_text(self, lid: int) -> str | None:
         """The text of the meter's current choice of list lid (from STATE), or None."""
@@ -200,6 +267,7 @@ class LcrPage(Page):
 
     def lcd_flags(self, reading) -> tuple[set, str]:
         """(lit annunciator words, mode text) for the Live page (module docstring)."""
+        self._follow_reading(reading)
         lit: set = set()
         st = self.state
         if st is not None:
@@ -239,7 +307,10 @@ class ComparePage(Page):
         items = (("quantity", "Quantity"), ("nominal", "Nominal"),
                  ("tolerance", "Tolerance %"), ("deviation", "Deviation %"),
                  ("ok", "Verdict"), ("passed", "Passed"), ("failed", "Failed"),
-                 ("value", "Value"), ("warn", "Warn type / sound / LED"))
+                 ("value", "Value"), ("warn", "Warn type / sound / LED"),
+                 ("result", "Result"), ("signed", "Signed deviation"),
+                 ("mode", "Mode in force / as set"), ("limits", "Limits in force"),
+                 ("secondary_limit", "Secondary limit"))
         for i, (key, name) in enumerate(items):
             r = StatRow(name, line=i < len(items) - 1)
             r.value.setObjectName("cmp_" + key)
@@ -282,6 +353,43 @@ class ComparePage(Page):
                        "stored. RAM only, not saved.", "hint", word_wrap=True))
         form.body.addStretch(1)
         top.addWidget(form, 1)
+        tol = Card("TOLERANCE_SET")
+        self.tol_mode = Segmented(["0 vendor", "1 %", "2 pF", "3 IEC"])
+        self.tol_lower = QDoubleSpinBox()
+        self.tol_upper = QDoubleSpinBox()
+        for w in (self.tol_lower, self.tol_upper):
+            w.setDecimals(2)                                  # 0.01 % / 0.01 pF steps
+            w.setRange(-999.99, 999.99)
+        self.tol_letter = QComboBox()
+        self.tol_letter.addItems(list(lc.TOL_LETTERS))
+        self.tol_kind = Segmented(["none", "D max", "Q min", "ESR max"])
+        self.tol_value = QDoubleSpinBox()
+        self.tol_value.setDecimals(4)
+        self.tol_value.setRange(0.0, 999999.0)
+        self.tol_button = self.control(QPushButton("TOLERANCE_SET"), lc.TOLERANCE_SET)
+        self.tol_button.clicked.connect(self.apply_tolerance)
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(10)
+        for r, (name, w) in enumerate((("Mode", self.tol_mode),
+                                       ("Lower limit (% or pF)", self.tol_lower),
+                                       ("Upper limit (% or pF)", self.tol_upper),
+                                       ("IEC 60062 letter", self.tol_letter),
+                                       ("Secondary limit", self.tol_kind),
+                                       ("Secondary value", self.tol_value))):
+            g.addWidget(label(name), r, 0)
+            g.addWidget(w, r, 1)
+        g.setColumnStretch(2, 1)
+        tol.add(g)
+        b = QHBoxLayout()
+        b.addWidget(self.tol_button)
+        b.addStretch(1)
+        tol.add(b)
+        tol.add(label("Mode 0 is the vendor tolerance of COMPARE_SET; mode 2 works with the "
+                      "compare quantity C only. RAM only; any later change of the meter's "
+                      "tolerance returns the mode to 0.", "hint", word_wrap=True))
+        tol.body.addStretch(1)
+        top.addWidget(tol, 1)
         self.body.addStretch(1)
         self.pending = None
         self.timer = QTimer(self)
@@ -313,6 +421,21 @@ class ComparePage(Page):
         L["failed"].setText(str(c.failed))
         L["value"].setText("%g" % c.value)
         L["warn"].setText("%d / %d / %d" % (c.warn_type, c.warn_sound, c.warn_led))
+        if c.result is None:                      # old firmware: 29-byte record, no tail
+            for k in ("result", "signed", "mode", "limits", "secondary_limit"):
+                L[k].setText("-")
+        else:
+            unit = "pF" if c.mode_in_force == 2 else "%"
+            L["result"].setText(c.result_name)
+            L["signed"].setText("%+g %s" % (c.signed_deviation, unit))
+            L["mode"].setText("%s / %s%s" % (
+                lc.COMPARE_MODE_IN_FORCE_NAME.get(c.mode_in_force, str(c.mode_in_force)),
+                lc.TOLERANCE_MODE_NAME.get(c.mode_set, str(c.mode_set)),
+                " " + c.letter if c.letter else ""))
+            L["limits"].setText("%g .. %g %s" % (c.lower, c.upper, unit))
+            L["secondary_limit"].setText("%s %g" % (
+                lc.SECONDARY_LIMIT_NAME.get(c.secondary_kind, str(c.secondary_kind)),
+                c.secondary_value) if c.secondary_kind else "none")
         if self.dirty("cmp"):
             return                       # the user is editing the form
         for w, v in ((self.nominal, c.nominal), (self.tolerance, c.tolerance)):
@@ -336,6 +459,22 @@ class ComparePage(Page):
 
         return self.run("COMPARE_SET", lambda p: dev.compare_set(*args), answered,
                         failed=lambda e: self.clean("cmp"))
+
+    def apply_tolerance(self):
+        dev = self.dev
+        mode = self.tol_mode.currentIndex()
+        if mode < 0 or self.tol_kind.currentIndex() < 0:
+            self.say("choose the mode and the secondary limit", error=True)
+            return None
+        args = (mode, round(self.tol_lower.value() * 100), round(self.tol_upper.value() * 100),
+                self.tol_letter.currentText(), self.tol_kind.currentIndex(),
+                self.tol_value.value())          # the call checks the ranges (ValueError)
+
+        def answered(c):
+            self.show_compare(c)
+            self.say("tolerance set by the meter")
+
+        return self.run("TOLERANCE_SET", lambda p: dev.tolerance_set(*args), answered)
 
     def on_shown(self) -> None:
         self.timer.start()

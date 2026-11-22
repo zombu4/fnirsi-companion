@@ -10,7 +10,7 @@ pages hold the commands and their logic (ui.base.Page), a view only places them:
                row of meter keys (LcKeysPage / C2KeysPage) attached while a meter is connected
   Trend, Log   TrendPage, LogPage
   Update       DrivePage, while an update drive is shown
-  LC1020E      Compare (ComparePage); Meter settings (LcSettingsPage, CalibrationPage, BackupPage)
+  LC1020E      Compare (ComparePage); Meter settings (LcSettingsPage, CalibrationPage, OcalPage, BackupPage)
   2C53T        Oscilloscope (ScopePage); Generator; Files; Meter settings (C2SettingsPage)
   Meter        MeterPage;  Screen  ScreenshotPage
   Diagnostics  the model's diagnostics page, its Keys page and the EventsPage
@@ -82,6 +82,7 @@ from .common.misc import EventsPage, PreferencesPage, ScreenshotPage
 from .jobs import JobRefused, JobRunner
 from .lc1020e import lcr as lc_lcr
 from .lc1020e.lcr import ComparePage, LcrPage
+from .lc1020e.ocal import OcalPage
 from .lc1020e.storage import BackupPage, CalibrationPage, LcSettingsPage
 from .lc1020e.tools import LcDiagnosticsPage, LcKeysPage
 from .widgets import Chip, ElidedLabel, Logo, NavButton, NavList, set_kind
@@ -984,9 +985,10 @@ class MainWindow(QMainWindow):
         if dev.model == "LC1020E":
             lcr, cmp, sett = LcrPage(ctx, dev), ComparePage(ctx, dev), LcSettingsPage(ctx, dev)
             cal, bak, keys = CalibrationPage(ctx, dev), BackupPage(ctx, dev), LcKeysPage(ctx, dev)
+            gain = OcalPage(ctx, dev)
             shot, diag = ScreenshotPage(ctx, dev, lc.SCREENSHOT), LcDiagnosticsPage(ctx, dev)
-            pages = [lcr, cmp, sett, cal, bak, keys, meter, shot, diag]
-            conn.views = {"compare": [cmp], "msettings": [sett, cal, bak], "meter": [meter],
+            pages = [lcr, cmp, sett, cal, gain, bak, keys, meter, shot, diag]
+            conn.views = {"compare": [cmp], "msettings": [sett, cal, gain, bak], "meter": [meter],
                           "screen": [shot]}
             conn.live = LiveModel(lc_lcr.LCD_WORDS, lcr.lcd_flags, True, lcr, keys.live_keys)
         else:

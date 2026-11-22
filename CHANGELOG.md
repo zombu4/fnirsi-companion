@@ -10,6 +10,29 @@
 - LC1020E: supports the INFO capability bit 21 "direct set" of the new firmware. With it set, SCREEN, LCR_SET, HOLD,
   SETTINGS_SET and COMPARE_SET wait 4 s for the answer (23 s / 63 s on firmware without the bit), and SETTINGS_SET /
   COMPARE_SET no longer switch the meter to the settings screen.
+- LC1020E: supports the INFO capability bits 22 to 24 of the new firmware. Bit 22: the frequency list has the
+  sixth entry 60 Hz (the selector shows the list as the meter reports it). Bit 23: TOLERANCE_SET (vendor, limits in
+  % or pF, IEC 60062 letter, secondary limit D / Q / ESR) and the 50-byte COMPARE record; the Compare page shows the
+  judgement (IN, HI, LO, ---, OUT), the signed deviation, the mode and the limits in force, and has a TOLERANCE_SET
+  form. Bit 24: the MEASURE marker byte (a main or secondary value outside the manual's accuracy table is shown
+  as "unspecified") and the save result 9 "unchanged". Firmware without the bits keeps its 64-byte MEASURE and
+  29-byte COMPARE records.
+- LC1020E: supports the own calibration area of the new firmware (INFO capability bit 26, commands 0x30 to 0x37,
+  event 0x98 OCAL_CHANGED, MEASURE byte 65). New page "Gain calibration" (Meter settings): the reference resistors
+  with their typed values and uncertainties, a run per resistor through the lock (autoranged cell and neighbours
+  per frequency and level, with a progress bar), the short and open steps, the solver (weighted least squares of
+  log magnitude and phase per frequency, anchors referred back through the fitted factors, identifiability bits,
+  residual checks per frequency and level, all-or-nothing per frequency) with its report, and Write GAIN with the
+  typed OK; cards "Constants" (CLIP from lock sweeps, SETTLE from settle traces, both editable) and "Level monitor"
+  (the DMM's AC volts per frequency give kV; the I check line). The LCR page shows Vac / Iac from MONITOR
+  ("uncalibrated" without a calibration) and the "gain cal" mark of the MEASURE flags with a warning for a
+  frequency whose cell is not calibrated. The Backup page lists the .ocal files (both area slots, bound to the
+  meter's UID), restores one record (another UID in the name or the record is refused), shows OCAL_INFO and
+  rolls back. Every write of the area reads both slots into a .ocal file first and needs the typed OK.
+- LC1020E: supports the INFO capability bit 25, the calibration sweep of the new firmware. CALIBRATE waits 366 s
+  (126 s on firmware without the bit), reads the 8-byte answer and shows the point (n/15) and the reason when the
+  sweep ends without a result; the progress line shows the point and the windows held (the step of the CALIBRATION
+  event counts 3 per point) instead of the vendor's seconds.
 
 ## 0.1.0 - 2026-11-21
 
