@@ -715,6 +715,8 @@ MON_V_CALIBRATED, MON_GAIN_APPLIED, MON_NO_READING, MON_LOCK = 1, 2, 4, 8
 TRACE_DISARM, TRACE_ARM, TRACE_READ = 0, 1, 2
 TRACE_STATE_NAME = {0: "idle", 1: "armed", 2: "recording", 3: "full"}
 TRACE_DISCARDED, TRACE_SATURATED = 1, 2
+TRACE_OUT_OF_BAND = 4            # PROTOCOL 5.7 0x36 bit 2: the first or second out-of-band acquisition in a
+                                 # row, discarded by the ranging band rule (not ranged)
 SETTLE_KIND_NAME = ["restart", "frequency", "level", "bias", "speed", "screen", "range or gain code"]
 
 # Sections (OCD 1.2)
@@ -1221,6 +1223,10 @@ class TraceEntry:
     @property
     def saturated(self) -> bool:
         return bool(self.flags & TRACE_SATURATED)
+
+    @property
+    def out_of_band(self) -> bool:
+        return bool(self.flags & TRACE_OUT_OF_BAND)
 
 
 @dataclass

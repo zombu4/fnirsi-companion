@@ -2238,6 +2238,10 @@ class OcalCommands(unittest.TestCase):
         self.assertEqual((t.state_name, t.kind, t.change_tick, t.count, len(t.entries)), ("full", 1, 1000, 32, 32))
         self.assertEqual([e.tick for e in t.entries[:3]], [1005, 1010, 1015])
         self.assertEqual([e.discarded for e in t.entries[:3]], [True, True, False])
+        self.assertFalse(any(e.out_of_band for e in t.entries))
+        # PROTOCOL 5.7 0x36 flags bit 2: discarded by the ranging band rule
+        e = lc.TraceEntry(0, 0.0, 0.0, lc.TRACE_OUT_OF_BAND | lc.TRACE_SATURATED, 0, 2, 3)
+        self.assertEqual((e.out_of_band, e.saturated, e.discarded), (True, True, False))
         self.assertAlmostEqual(t.entries[0].z.real, 1500.0, delta=1e-3)        # 1000 + 500 exp(0)
         self.assertAlmostEqual(t.entries[31].z.real, 1000.0 + 500 * math.exp(-31 / 4), delta=1e-2)
         self.assertEqual(b.dev.ocal_trace_disarm().state, 0)
