@@ -528,6 +528,22 @@ class Lc1020ePages(Bench):
         pp.theme.setCurrentIndex(pp.theme.findData("dark"))
         self.assertEqual(self.settings.get("theme"), "dark")
 
+    def test_calibration_started_on_the_meter_shows_its_end(self):
+        # SL 5.3.3 / 7.3 / 10: a calibration started by KEY 0x008 on item 5 or the meter's keys
+        # has no CALIBRATE answer; its CALIBRATION event with status 2 or 3 is the result
+        cal = self.page("Calibration")
+        link = self.win.active.link
+        link.event_frame.emit(fl.Frame(1, 4, lc.EV_CALIBRATION, bytes([1, 13, 11]), 0.0))
+        self.assertTrue(wait(lambda: "status busy" in cal.progress.text()))
+        self.assertEqual(cal.result.text(), "—")                   # status 1: no end yet
+        link.event_frame.emit(fl.Frame(2, 4, lc.EV_CALIBRATION, bytes([3, 13, 11]), 0.0))
+        self.assertTrue(wait(lambda: "calibration started on the meter ended: status fail"
+                             in cal.result.text()))
+        self.assertIn("type 11", cal.result.text())
+        link.event_frame.emit(fl.Frame(3, 4, lc.EV_CALIBRATION, bytes([2, 45, 0]), 0.0))
+        self.assertTrue(wait(lambda: "status finish" in cal.result.text()))
+        self.assertIn("SAVE_RESULT", cal.result.text())
+
 
 # ----------------------------------------------------------------------------------------------
 class Lc1020eNewFirmwarePages(Bench):

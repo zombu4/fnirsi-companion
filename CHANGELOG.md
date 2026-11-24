@@ -33,6 +33,13 @@
   (126 s on firmware without the bit), reads the 8-byte answer and shows the point (n/15) and the reason when the
   sweep ends without a result; the progress line shows the point and the windows held (the step of the CALIBRATION
   event counts 3 per point) instead of the vendor's seconds.
+- LC1020E: the reading is what the meter shows. A valid value block whose text is a number equal to 0 has the value
+  0 (the firmware sends a negative series R, parallel C, series L or D as text 0 with its float negative, and Q as
+  "0.0000" beside a C or L shown as 0); statistics and trend count that 0. The display text is read up to its first
+  0 byte (older firmware could leave bytes of a longer text after it).
+- LC1020E: the Calibration page shows the end (finish or fail, the step and the type) of a calibration started on
+  the meter (OK on menu item 5, by KEY or the meter's keys) from its CALIBRATION event; the reason of a failure comes
+  only in the CALIBRATE answer. Reason 2 reads "a short or reference point's 20-s limit with fewer than 3 windows".
 
 ## 0.1.0 - 2026-11-21
 

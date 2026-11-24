@@ -581,6 +581,22 @@ class DirectSet(unittest.TestCase):
         self.assertEqual(lc.cal_progress({"status": 1, "step": 7, "type": 11}, False),
                          "status busy, step 7 s, type 11")
 
+    def test_calibration_end_from_its_event(self):
+        # SL 10: CALIBRATION event status 2 finish / 3 fail; the only record of a calibration
+        # started by KEY 0x008 on item 5 or the meter's keys (SL 5.3.3, 7.3)
+        self.assertIsNone(lc.cal_event_result({"status": 1, "step": 7, "type": 11}, True))
+        self.assertIsNone(lc.cal_event_result({"status": 0, "step": 0, "type": 11}, True))
+        ok = lc.cal_event_result({"status": 2, "step": 45, "type": 0}, True)
+        self.assertTrue(ok.startswith("calibration started on the meter ended: status finish, "
+                                      "storing, type 0"))
+        self.assertIn("SAVE_RESULT", ok)
+        bad = lc.cal_event_result({"status": 3, "step": 13, "type": 11}, True)
+        self.assertTrue(bad.startswith("calibration started on the meter ended: status fail, "
+                                       "point 5/15, 1 of 3 windows, type 11"))
+        self.assertIn("Fail n/15", bad)
+        self.assertEqual(lc.CAL_REASON[2],
+                         "a short or reference point's 20-s limit with fewer than 3 windows")
+
     def test_old_firmware_settings_set_goes_to_screen_3(self):
         d = Bench(self).dev
         self.assertEqual(d.screen(2).screen, 2)
@@ -617,11 +633,14 @@ class NewFirmwareFeatures(unittest.TestCase):
             lc.parse_measure(fk.build_measure()[:63])
 
     def test_signed_and_overload_texts_and_marker_reading(self):
-        neg = fk.build_value(-1.0036, 1, 4, 0, "-1.0036")
+        # SL 6.2 offset 7 (revision 14): a negative series R is sent as "0.0000" (unit 1, 4
+        # decimals, marker bit set) with its float negative; the reading is the 0 shown
+        neg = fk.build_value(-1.0036, 1, 4, 0, "0.0000")
         m = lc.parse_measure(fk.build_measure(secondary_kind=0, secondary=neg, markers=2))
         r = lc.measure_to_reading(m, 1.0, 2.0)
-        self.assertEqual(r.secondary.text, "-1.0036 Ω")
-        self.assertAlmostEqual(r.secondary.value, -1.0036, 4)
+        self.assertEqual(r.secondary.text, "0.0000 Ω")
+        self.assertEqual(r.secondary.value, 0.0)
+        self.assertAlmostEqual(m.secondary.value, -1.0036, 4)      # the float stays in the block
         self.assertTrue(r.secondary.unspecified)
         self.assertFalse(r.unspecified)
         r1 = lc.measure_to_reading(lc.parse_measure(fk.build_measure(markers=1)), 1.0, 2.0)
@@ -632,6 +651,58 @@ class NewFirmwareFeatures(unittest.TestCase):
         r = lc.measure_to_reading(m, 1.0, 2.0)
         self.assertEqual((r.validity, r.value, r.text), ("overload", None, "0L  "))
         self.assertFalse(r.secondary.unspecified)
+
+    def test_text_ends_at_its_first_zero(self):
+        # SL 6.2 offset 7: firmware before revision 12 could leave bytes of a longer text after
+        # the terminating 0; the text is read up to its first 0
+        b = lc.parse_value_block(fk.build_value(1.5, 1, 4, 0, "1.5000\x003"))
+        self.assertEqual(b.text, "1.5000")
+        r = lc.measure_to_reading(lc.parse_measure(fk.build_measure(main_row=1, main=fk.build_value(
+            -0.2, 1, 4, 0, "0.0000\x007"))), 1.0, 2.0)
+        self.assertEqual((r.text, r.value), ("0.0000 Ω", 0.0))
+
+    def test_overload_in_every_block_at_100_hz(self):
+        # SL 6.2 offset 7 (revision 14): "0L" in every value block at 60, 100 and 120 Hz when |Z|
+        # is above 1e7 ohm; validity 1, no value
+        ol = fk.build_value(2.2e7, 0, 0, 1, "0L")
+        m = lc.parse_measure(fk.build_measure(main_row=4, main=ol, secondary_kind=4,
+                                              secondary=fk.build_value(-89.0, 0, 0, 1, "0L"),
+                                              z=2.2e7, frequency=100))
+        r = lc.measure_to_reading(m, 1.0, 2.0)
+        self.assertEqual((r.validity, r.value, r.text), ("overload", None, "0L"))
+        self.assertEqual((r.secondary.validity, r.secondary.value, r.secondary.text),
+                         ("overload", None, "0L"))
+
+    def test_d_and_q_beside_c_or_l_shown_as_0(self):
+        # SL 6.2 offset 7 (revision 15): with the main C or L shown as 0, D is "0L" (validity 1)
+        # and Q "0.0000" (validity 0) whatever its float
+        c0 = fk.build_value(-0.4, 4, 1, 0, "0.0")          # parallel C below 0: "0.0" pF
+        d = lc.measure_to_reading(lc.parse_measure(fk.build_measure(
+            main_row=2, main=c0, secondary_kind=2, secondary=fk.build_value(1.2e3, 0, 0, 1, "0L"))),
+            1.0, 2.0)
+        self.assertEqual((d.value, d.text), (0.0, "0.0 pF"))
+        self.assertEqual((d.secondary.validity, d.secondary.value, d.secondary.text),
+                         ("overload", None, "0L"))
+        l0 = fk.build_value(-3.1, 8, 1, 0, "0.0")          # series L below 0: "0.0" uH
+        q = lc.measure_to_reading(lc.parse_measure(fk.build_measure(
+            main_row=3, main=l0, secondary_kind=3,
+            secondary=fk.build_value(0.37, 0, 4, 0, "0.0000"))), 1.0, 2.0)
+        self.assertEqual((q.value, q.text), (0.0, "0.0 µH"))
+        self.assertEqual((q.secondary.validity, q.secondary.value, q.secondary.text),
+                         ("valid", 0.0, "0.0000"))
+
+    def test_valid_nonzero_text_keeps_its_float(self):
+        x = fk.build_value(-12.5, 1, 2, 0, "-12.50")       # X carries its own '-' (SL 6.2)
+        r = lc.measure_to_reading(lc.parse_measure(fk.build_measure(
+            main_row=1, main=fk.build_value(2.2e3, 2, 4, 0, "2.2000"), secondary_kind=1,
+            secondary=x)), 1.0, 2.0)
+        self.assertAlmostEqual(r.value, 2.2e3, 3)
+        self.assertEqual(r.text, "2.2000 kΩ")
+        self.assertAlmostEqual(r.secondary.value, -12.5, 5)
+        self.assertEqual(r.secondary.text, "-12.50 Ω")
+        held = lc.measure_to_reading(lc.parse_measure(fk.build_measure(      # validity 0 only
+            main_row=1, main=fk.build_value(5.0, 1, 1, 3, "0.0"))), 1.0, 2.0)
+        self.assertEqual((held.validity, held.value), ("held", 5.0))
 
     def test_measure_over_the_link(self):
         b = Bench(self, caps=fk.NEW_CAPS)

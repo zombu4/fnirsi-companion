@@ -311,8 +311,10 @@ def parse_state(d: bytes) -> State:
 
 @dataclass
 class ValueBlock:
-    """Value block, 15 bytes (SL 6.2). value is in the base unit of the quantity (ohm, nF, uH,
-    plain, degrees); unit is the code of the display text."""
+    """Value block, 15 bytes (SL 6.2). value is the float as the meter sent it, in the base unit of
+    the quantity (ohm, nF, uH, plain, degrees); a negative R, C, L, D or Q keeps its sign there
+    while its text is 0 or "0L". unit is the code of the display text; text is the display text up
+    to its first 0 byte (firmware before revision 12 could leave bytes of a longer text after it)."""
     value: float
     unit: int
     decimals: int
@@ -323,7 +325,7 @@ class ValueBlock:
 
 def parse_value_block(d: bytes, pos: int = 0) -> ValueBlock:
     v, unit, dec, val, txt = struct.unpack_from("<fBBB8s", d, pos)
-    return ValueBlock(v, unit, dec, val, txt.rstrip(b"\0").decode("ascii", "replace"))
+    return ValueBlock(v, unit, dec, val, txt.split(b"\0", 1)[0].decode("ascii", "replace"))
 
 
 @dataclass
@@ -481,7 +483,7 @@ def parse_save_answer(status: int, d: bytes, restarts_on_ok: bool = False) -> Sa
 
 
 # SL 5.3.3, answer byte 7 (CAP_CAL_SWEEP): why the sweep ended without a result
-CAL_REASON = {0: "none", 1: "no acquisition for 1.5 s", 2: "the point's 20-s limit with fewer than 3 windows",
+CAL_REASON = {0: "none", 1: "no acquisition for 1.5 s", 2: "a short or reference point's 20-s limit with fewer than 3 windows",
               3: "an open point below 100 kohm", 4: "the vendor's store check (table written back as it was)",
               5: "the point's limit with 3 windows that do not agree",
               6: "ended by a key, the dialog closed or the screen left"}
@@ -528,6 +530,21 @@ def cal_progress(fields: dict, sweep: bool) -> str:
     else:
         where = "step %d s" % step
     return "status %s, %s, type %d" % (status, where, fields["type"])
+
+
+def cal_event_result(fields: dict, sweep: bool) -> str | None:
+    """The end of a calibration from its CALIBRATION event (SL 10: sent when the status word
+    0x200050EC or the step changed): status 2 finish or 3 fail, else None. This is the only record
+    of a calibration the host did not start (KEY 0x008 on menu item 5, or the meter's keys; SL
+    5.3.3, 7.3); its failed point and reason are sent only in the CALIBRATE answer."""
+    if fields.get("status") not in (2, 3):
+        return None
+    text = "calibration started on the meter ended: " + cal_progress(fields, sweep)
+    if fields["status"] == 2:
+        return text + "; the meter saves the result itself (SL 5.3.3), its save status comes " \
+                      "as the SAVE_RESULT event"
+    return text + "; the reason is not sent outside the CALIBRATE answer, the meter's dialog " \
+                  "shows \"Fail n/15\" and the reason (SL 5.3.3)"
 
 
 @dataclass
@@ -1339,15 +1356,29 @@ class OcalRollbackResult:
 # MEASURE record -> Reading (SI units, validity, statistics key)
 # ----------------------------------------------------------------------------------------------
 
+def _text_is_zero(text: str) -> bool:
+    """The display text (already cut at its first 0 byte) is a number equal to 0."""
+    try:
+        return float(text.strip()) == 0.0
+    except ValueError:
+        return False
+
+
 def _block_reading(quantity: str, b: ValueBlock, t: float, wall: float, meter_ms: int,
                    key: tuple) -> Reading:
-    """One value block as a Reading (value in SI base units; SL 6.2)."""
+    """One value block as a Reading (value in SI base units; SL 6.2). The reading is what the
+    meter shows: a valid block whose text is a number equal to 0 has the value 0, whatever the
+    float (SL 6.2 offsets 0 and 7: a negative series R, parallel C, series L or D is sent as text
+    0 with its float negative, and Q as "0.0000" beside a C or L shown as 0 with the measured
+    float). The float stays in ValueBlock.value."""
     scale, si = QUANTITY_SI.get(quantity, (1.0, ""))
     validity = VALIDITY_NAME.get(b.validity, "unknown")
     value: float | None
     if quantity not in QUANTITY_SI or validity in ("overload", "no reading", "unknown") \
             or not math.isfinite(b.value):
         value = None
+    elif validity == "valid" and _text_is_zero(b.text):
+        value = 0.0
     else:
         value = b.value * scale
     unit_text = UNIT_TEXT.get(b.unit, "")

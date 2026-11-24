@@ -215,6 +215,14 @@ class CalibrationPage(Page):
         if isinstance(ev, lc.Event) and ev.cmd == lc.EV_CALIBRATION and "status" in ev.fields:
             sweep = self.dev is not None and self.dev.info.has(lc.CAP_CAL_SWEEP)
             self.progress.setText(lc.cal_progress(ev.fields, sweep))
+            # The end of a calibration the companion did not start (KEY 0x008 on item 5 or the
+            # meter's keys, SL 5.3.3): its event is the only record of it. During a CALIBRATE job
+            # the answer sets the result (with the failed point and the reason).
+            job = self.ctx.jobs.exclusive_job
+            ours = job is not None and job.what.startswith("CALIBRATE")
+            end = lc.cal_event_result(ev.fields, sweep)
+            if end is not None and not ours:
+                self.result.setText(end)
 
 
 def run_calibration(page: Page, dev, cal_type: int, word: str, label: QLabel):
